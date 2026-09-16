@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=600, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=600, suite="base-b-test-2-npu-a3")
 
 # Domino draft model. Community HF checkpoint; SGLang resolves the id lazily on
 # the test host (matching the CUDA e2e test), so keep it as the raw repo id
