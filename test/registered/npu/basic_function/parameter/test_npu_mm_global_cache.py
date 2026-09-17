@@ -1,7 +1,11 @@
 import base64
 import io
+import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import unittest
 from urllib.parse import urlparse
@@ -42,13 +46,83 @@ class TestNpuMmGlobalCache(CustomTestCase):
       - prefill/decode KV transfer: --disaggregation-transfer-backend ascend
       - card split: encode(gpu0) + prefill(gpu1) + decode(gpu2), each tp=1
 
-    The global embed cache relies on a deployed Ascend MemCache instance, whose
-    connection settings are provided via the SGLANG_MM_GLOBAL_CACHE_MEMCACHE_CONFIG_PATH
-    environment variable. The cache-hit test is skipped when that config is absent.
+    The global embed cache relies on Ascend MemCache (MetaService/LocalService).
+    When SGLANG_MM_GLOBAL_CACHE_MEMCACHE_CONFIG_PATH is not provided, the test
+    self-launches a local MetaService and generates its own LocalService config
+    so the cache-hit path runs end-to-end (no external MemCache deployment).
 
     [Test Category] Functional
     [Test Target] --enable-mm-global-cache / --mm-global-cache-backend=npu_memcache
     """
+
+    @classmethod
+    def _ensure_memcache(cls):
+        """Make a MemCache (MetaService + LocalConfig) available for the test.
+
+        Reuses an external deployment when SGLANG_MM_GLOBAL_CACHE_MEMCACHE_CONFIG_PATH
+        is set; otherwise spins up a local MetaService via
+        ``sglang.srt.mem_cache.storage.npu_memcache.start_meta_service`` and writes a
+        LocalService JSON config, leaking neither the meta process nor the config.
+        """
+        cls._meta_proc = None
+        cls._meta_tmpdir = None
+        if cls.cache_cfg_path:
+            return
+
+        cls._meta_tmpdir = tempfile.mkdtemp(prefix="npu_mm_global_cache_meta_")
+        meta_port, cfg_port = 25037, 25038
+        meta_url = f"tcp://127.0.0.1:{meta_port}"
+        cfg_store_url = f"tcp://127.0.0.1:{cfg_port}"
+
+        meta_cfg_path = os.path.join(cls._meta_tmpdir, "metaservice_config.json")
+        with open(meta_cfg_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "meta_service_url": meta_url,
+                    "config_store_url": cfg_store_url,
+                    "log_level": "info",
+                },
+                f,
+            )
+
+        cls.cache_cfg_path = os.path.join(cls._meta_tmpdir, "localservice_config.json")
+        with open(cls.cache_cfg_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "meta_service_url": meta_url,
+                    "config_store_url": cfg_store_url,
+                    "log_level": "info",
+                    # Values below mirror the HiCache npu_memcache LocalService
+                    # config (see npu_memcache/README.md): host_tcp needs no RDMA;
+                    # device_id/init_bm are control keys consumed by SGLang.
+                    "world_size": 256,
+                    "protocol": "host_tcp",
+                    "dram_size": "1GB",
+                    "device_id": 0,
+                    "init_bm": True,
+                },
+                f,
+            )
+
+        meta_log = open(
+            os.path.join(cls._meta_tmpdir, "meta.out"), "w", encoding="utf-8"
+        )
+        cls._meta_err = open(
+            os.path.join(cls._meta_tmpdir, "meta.err"), "w", encoding="utf-8"
+        )
+        cmd = [
+            "python3",
+            "-m",
+            "sglang.srt.mem_cache.storage.npu_memcache.start_meta_service",
+            "--config_path",
+            meta_cfg_path,
+        ]
+        print("Starting MetaService:", " ".join(cmd))
+        cls._meta_proc = subprocess.Popen(
+            cmd, stdout=meta_log, stderr=cls._meta_err, env=os.environ.copy()
+        )
+        # Give MetaService time to bind its listeners before the encoder connects.
+        time.sleep(5)
 
     @classmethod
     def setUpClass(cls):
@@ -76,10 +150,7 @@ class TestNpuMmGlobalCache(CustomTestCase):
         )
 
         cls.memcache_env = {**os.environ, "ASCEND_MF_STORE_URL": "tcp://127.0.0.1:24667"}
-        if cls.cache_cfg_path:
-            cls.memcache_env["SGLANG_MM_GLOBAL_CACHE_MEMCACHE_CONFIG_PATH"] = (
-                cls.cache_cfg_path
-            )
+        cls._ensure_memcache()
 
         cls.encode_stdout = io.StringIO()
         cls.encode_stderr = io.StringIO()
@@ -117,12 +188,11 @@ class TestNpuMmGlobalCache(CustomTestCase):
             cls.encode_port,
             "--disable-cuda-graph",
         ]
-        if cls.cache_cfg_path:
-            encode_args += [
-                "--enable-mm-global-cache",
-                "--mm-global-cache-backend",
-                "npu_memcache",
-            ]
+        encode_args += [
+            "--enable-mm-global-cache",
+            "--mm-global-cache-backend",
+            "npu_memcache",
+        ]
         cls.process_encode = popen_launch_server(
             cls.model,
             base_url=cls.encode_url,
@@ -228,6 +298,20 @@ class TestNpuMmGlobalCache(CustomTestCase):
                 except Exception as e:
                     print(f"Error killing process {proc.pid}: {e}")
 
+        if getattr(cls, "_meta_proc", None) and cls._meta_proc.poll() is None:
+            try:
+                terminate_and_kill_process_tree(cls._meta_proc)
+            except Exception as e:
+                print(f"Error killing MetaService process: {e}")
+        meta_err = getattr(cls, "_meta_err", None)
+        if meta_err is not None:
+            try:
+                meta_err.close()
+            except Exception:
+                pass
+        if getattr(cls, "_meta_tmpdir", None) and os.path.exists(cls._meta_tmpdir):
+            shutil.rmtree(cls._meta_tmpdir, ignore_errors=True)
+
     def _client(self):
         return openai.Client(api_key=self.api_key, base_url=f"{self.lb_url}/v1")
 
@@ -243,10 +327,6 @@ class TestNpuMmGlobalCache(CustomTestCase):
         return [(int(m[1]), int(m[2]), int(m[3])) for m in pattern.finditer(log)]
 
     def test_image_cache_hit(self):
-        if not self.cache_cfg_path:
-            self.skipTest(
-                "mm-global-cache not enabled: SGLANG_MM_GLOBAL_CACHE_MEMCACHE_CONFIG_PATH not set"
-            )
         client = self._client()
         baseline = len(self._parse_cache_log())
         for _ in range(2):
