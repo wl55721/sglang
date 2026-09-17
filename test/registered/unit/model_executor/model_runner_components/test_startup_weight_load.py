@@ -52,6 +52,7 @@ def _make_options(**overrides):
     options = StartupWeightLoadOptions(
         device="cuda",
         is_cuda_platform=True,
+        is_npu=False,
         cuda_graph_enabled=True,
         prefill_cuda_graph_backend=Backend.FULL,
         is_draft_worker=False,
@@ -204,6 +205,14 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             self._create(options=_make_options(tp_size=2)),
             StartupWeightLoadManager,
         )
+        self.assertIsInstance(
+            self._create(
+                options=_make_options(
+                    device="npu", is_cuda_platform=False, is_npu=True
+                )
+            ),
+            StartupWeightLoadManager,
+        )
 
     def test_options_accept_current_server_args_schema(self):
         """Removed server options must not break overlap startup initialization."""
@@ -224,7 +233,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             (
                 "non_cuda",
                 dict(options=_make_options(device="cpu", is_cuda_platform=False)),
-                "CUDA only",
+                "CUDA or NPU only",
             ),
             (
                 "graphs_disabled",
