@@ -124,7 +124,7 @@ def _measure_config(int8_enabled, plan):
         "ascend",
         "--mem-fraction-static",
         "0.8",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
         "--max-mamba-cache-size",
         str(MAX_MAMBA_CACHE_SIZE),
