@@ -59,13 +59,25 @@ DEFAULT_MEMCACHE_PROTOCOL = "device_sdma"
 DEFAULT_MEMCACHE_DRAM_SIZE = "1GB"
 DEFAULT_MEMCACHE_WORLD_SIZE = 256
 
-# Minimal env set to run DeepSeek-V4-Flash W8A8 on NPU without MTP/deepep.
+# Minimal env set to load DeepSeek-V4-Flash W8A8 (modelslim) on NPU without
+# MTP/deepep. The SGLANG_OPT_* flags disable CUDA/ROCm fast-paths whose quantized
+# layouts do not match the modelslim W8A8 checkpoint; without them the model
+# fails to load (e.g. wq_a/wkv fused-path dtype mismatch). Aligned with the
+# accuracy suite's "skip gpu branch" env block.
 DEEPSEEK_V4_FLASH_W8A8_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "SGLANG_DSV4_FP4_EXPERTS": "0",
+    "SGLANG_DSV4_FP4_EXPERTS": "False",
+    "SGLANG_OPT_FP8_WO_A_GEMM": "0",
+    "SGLANG_OPT_FUSE_WQA_WKV": "0",
+    "SGLANG_OPT_BF16_FP32_GEMM_ALGO": "torch",
+    "SGLANG_OPT_USE_FUSED_HASH_TOPK": "False",
+    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
+    "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
+    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
+    "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
 }
 
