@@ -440,7 +440,13 @@ class NpuMemcacheStore(HiCacheStorage):
         # key_multiplier records how many component keys are generated per page.
         name = transfer.name
         suffixes = []
-        if name == PoolName.INDEXER:
+        if name == PoolName.KV:
+            # External-linker device KV pool is a rank-replicated merged-KV
+            # object: one ``_k`` object per page (DSA / DeepSeek-V4). MHA k/v
+            # split is not reachable here because only the DSA/DeepSeek-V4
+            # strategies implement ``build_direct_linker_pool_group`` today.
+            suffixes = [f"_{self.mla_suffix}_k"]
+        elif name == PoolName.INDEXER:
             suffixes = [f"_{self.mla_suffix}_{PoolName.INDEXER}"]
         elif name == PoolName.MAMBA:
             mamba_pool = getattr(self, "registered_pools", {}).get(PoolName.MAMBA)
@@ -477,25 +483,35 @@ class NpuMemcacheStore(HiCacheStorage):
         kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        # Start from every KV prefix and drop the stop points each extra pool
+        # cannot serve. Keep the whole set (not just its maximum) so a
+        # TRAILING_PAGES pool leaves holes the caller can intersect across ranks.
+        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if not restorable:
                 break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 qkeys, transfer
             )
             ex = self._batch_exist(component_keys)
-            page_exists = [
-                all(r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier])
-                for i in range(kv_pages)
-            ]
+            if key_multiplier > 0:
+                page_exists = [
+                    all(
+                        r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                    )
+                    for i in range(kv_pages)
+                ]
+            else:
+                page_exists = [False] * kv_pages
             boundary = 0
+            pool_restorable = []
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 try:
                     boundary = page_exists.index(False)
                 except ValueError:
                     boundary = kv_pages
+                pool_restorable = list(range(1, boundary + 1))
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 for prefix_len in range(kv_pages, 0, -1):
@@ -503,13 +519,18 @@ class NpuMemcacheStore(HiCacheStorage):
                         page_exists[i]
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
-                        boundary = prefix_len
-                        break
+                        pool_restorable.append(prefix_len)
+                        if boundary == 0:
+                            boundary = prefix_len
+            else:
+                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:
                 hit_count[transfer.name] = boundary
-            final_pages = min(final_pages, boundary)
+            pool_restorable_set = set(pool_restorable)
+            restorable = [p for p in restorable if p in pool_restorable_set]
 
-        return PoolTransferResult(final_pages, hit_count)
+        final_pages = restorable[-1] if restorable else 0
+        return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
@@ -580,6 +601,58 @@ class NpuMemcacheStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
         return self._batch_io_v2(transfers, is_set=True)
+
+    @property
+    def supports_layered_io(self) -> bool:
+        """Whether the MemCache object store exposes native layered I/O.
+
+        The external-linker (direct) path writes each page object as ``num_layers``
+        layer buffers and reads them back layer-by-layer to overlap compute.
+        ``memcache_hybrid`` provides this via ``batch_put_from_layers`` /
+        ``batch_get_into_layers``; when absent the caller must fall back to a
+        whole-object ``batch_get_v2`` read.
+        """
+        return self.store is not None and all(
+            hasattr(self.store, name)
+            for name in ("batch_get_into_layers", "batch_put_from_layers")
+        )
+
+    def batch_get_into_layers(
+        self,
+        keys: List[str],
+        buffer_ptrs_list: List[List[int]],
+        sizes_list: List[List[int]],
+    ) -> bool:
+        """Read per-key layer buffers directly into device memory.
+
+        ``memcache_hybrid`` layered contract: one key maps to one or more device
+        buffers (the stored object's layers). ``buffer_ptrs_list``/``sizes_list``
+        are key-major (outer) and layer-major (inner), aligned with how the
+        object was written via :meth:`batch_put_from_layers`.
+
+        Returns True only when every requested layer of every key transferred.
+        """
+        if not keys:
+            return True
+        raw = self.store.batch_get_into_layers(keys, buffer_ptrs_list, sizes_list)
+        # memcache_hybrid reports 0 on success per key.
+        if isinstance(raw, int):
+            raw = [raw] * len(keys)
+        return len(raw) == len(keys) and all(int(code) == 0 for code in raw)
+
+    def batch_put_from_layers(
+        self,
+        keys: List[str],
+        buffer_ptrs_list: List[List[int]],
+        sizes_list: List[List[int]],
+    ) -> bool:
+        """Write each key's object from its per-layer device buffers."""
+        if not keys:
+            return True
+        raw = self.store.batch_put_from_layers(keys, buffer_ptrs_list, sizes_list)
+        if isinstance(raw, int):
+            raw = [raw] * len(keys)
+        return len(raw) == len(keys) and all(int(code) == 0 for code in raw)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (

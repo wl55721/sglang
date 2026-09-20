@@ -210,6 +210,12 @@ def _create_unified_radix_cache(
             )
 
             linker_cls = UMBPDirectLinker
+        elif backend == "npu_memcache":
+            from sglang.srt.mem_cache.storage.npu_memcache.npu_memcache_direct_linker import (
+                NpuMemcacheDirectLinker,
+            )
+
+            linker_cls = NpuMemcacheDirectLinker
         else:
             raise ValueError(
                 f"Unknown unified cache external linker backend: {backend!r}"

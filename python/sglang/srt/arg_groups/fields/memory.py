@@ -217,7 +217,7 @@ class Memory(msgspec.Struct):
         str,
         Arg(
             help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake", "mori"],
+            choices=["mooncake", "mori", "npu_memcache"],
         ),
     ] = "mooncake"
 
