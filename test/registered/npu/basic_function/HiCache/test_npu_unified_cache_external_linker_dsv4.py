@@ -23,6 +23,7 @@ import importlib.util
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -83,6 +84,7 @@ class NpuMemcacheTestServices:
     def __init__(self, config_path=None):
         self.config_path = config_path or envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.get()
         self._owned_config_path = None
+        self._log_path = None
         self.process = None
 
     @staticmethod
@@ -126,10 +128,21 @@ class NpuMemcacheTestServices:
         return path
 
     @property
-    def metrics_url(self):
+    def _config(self):
         with open(self.config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        return cfg.get("metrics_url", "http://127.0.0.1:8000")
+            return json.load(f)
+
+    @property
+    def metrics_url(self):
+        return self._config.get("metrics_url", "http://127.0.0.1:8000")
+
+    @property
+    def meta_service_url(self):
+        return self._config.get("meta_service_url", "tcp://127.0.0.1:5000")
+
+    @property
+    def config_store_url(self):
+        return self._config.get("config_store_url", "tcp://127.0.0.1:6000")
 
     def start(self):
         if not self.config_path:
@@ -149,36 +162,82 @@ class NpuMemcacheTestServices:
             "--config_path",
             self.config_path,
         ]
-        logger.info("Starting Ascend MemCache MetaService: %s", " ".join(cmd))
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+        # Capture MetaService output to a file: it dies silently under DEVNULL and
+        # its logs are required to debug startup / readiness failures.
+        fd, self._log_path = tempfile.mkstemp(
+            prefix="npu_memcache_metaservice_", suffix=".log"
         )
-        self._wait_until_ready()
+        os.close(fd)
+        log_stream = open(self._log_path, "w", encoding="utf-8")
+        logger.info("Starting Ascend MemCache MetaService: %s", " ".join(cmd))
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            log_stream.close()
+        try:
+            self._wait_until_ready()
+        except Exception:
+            self._dump_log()
+            raise
 
     def _wait_until_ready(self):
-        parsed = urlparse(self.metrics_url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 8000
-        probe = f"http://{host}:{port}"
         deadline = time.monotonic() + META_SERVICE_SETUP_TIMEOUT
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError(
                     f"Ascend MemCache MetaService exited with code {self.process.returncode}"
                 )
-            try:
-                if requests.get(probe, timeout=3).status_code == 200:
-                    logger.info("Ascend MemCache MetaService is ready at %s", probe)
-                    return
-            except requests.RequestException:
-                pass
+            if self._probe_services():
+                logger.info("Ascend MemCache MetaService is ready.")
+                return
             time.sleep(3)
         raise TimeoutError(
-            f"Timed out after {META_SERVICE_SETUP_TIMEOUT}s waiting for MetaService at {probe}"
+            f"Timed out after {META_SERVICE_SETUP_TIMEOUT}s waiting for Ascend MemCache MetaService"
         )
+
+    def _probe_services(self):
+        # Readiness = the meta/config-store TCP endpoints (or the metrics HTTP
+        # endpoint) are reachable. We do not require an HTTP 200 because the
+        # metrics server may answer 4xx on its root path while still being up.
+        for url in (self.meta_service_url, self.config_store_url, self.metrics_url):
+            parsed = urlparse(url)
+            host = parsed.hostname or "127.0.0.1"
+            if parsed.scheme in ("http", "https"):
+                try:
+                    requests.get(url, timeout=3)
+                    return True
+                except requests.RequestException:
+                    continue
+            if self._is_port_open(host, parsed.port or 5000):
+                return True
+        return False
+
+    @staticmethod
+    def _is_port_open(host, port):
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except OSError:
+            return False
+
+    def _dump_log(self):
+        if not self._log_path or not os.path.exists(self._log_path):
+            return
+        try:
+            with open(self._log_path, "r", encoding="utf-8", errors="replace") as f:
+                tail = "".join(f.readlines()[-50:]).rstrip()
+            logger.error(
+                "Ascend MemCache MetaService log (%s):\n%s",
+                self._log_path,
+                tail or "(empty)",
+            )
+        except OSError as e:
+            logger.warning("Failed to read MetaService log: %s", e)
 
     def stop(self):
         if self.process is not None:
@@ -197,6 +256,13 @@ class NpuMemcacheTestServices:
                 logger.warning("Failed to remove generated MemCache config: %s", e)
             finally:
                 self._owned_config_path = None
+        if self._log_path is not None:
+            try:
+                os.remove(self._log_path)
+            except OSError as e:
+                logger.warning("Failed to remove MetaService log %s: %s", self._log_path, e)
+            finally:
+                self._log_path = None
 
     def server_env(self):
         """Env to pass to the SGLang server's client-side ``NpuMemcacheStore``."""
