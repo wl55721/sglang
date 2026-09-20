@@ -98,16 +98,24 @@ class TestNPUHiCacheStoragePrefetchRetry(CustomTestCase):
                 },
             },
         )
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.status_code,
+            200,
+            f"generate failed: {response.status_code} - {response.text}",
+        )
         return response.json()
 
     def _flush_cache(self):
         response = requests.post(
-            f"{self.base_url}/flush_cache",
+            f"{DEFAULT_URL_FOR_TEST}/flush_cache",
             params={"timeout": 30},
             timeout=40,
         )
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.status_code,
+            200,
+            f"flush_cache failed: {response.status_code} - {response.text}",
+        )
 
     @staticmethod
     def _gen_prompt(tokenizer, token_num):
