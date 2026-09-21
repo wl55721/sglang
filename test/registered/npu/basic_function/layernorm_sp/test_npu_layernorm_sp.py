@@ -15,6 +15,7 @@ harness), so it runs on any NPU box rather than only the CI host rooted at
 """
 
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -34,6 +35,11 @@ register_npu_ci(est_time=400, suite="full-2-npu-a3", nightly=True)
 
 # Qwen3-8B tp=2 bf16 GSM8K baseline; --enable-layernorm-sp must match it.
 LAYERNORM_SP_ACCURACY = 0.85
+
+# Marker printed by sglang.srt.layers.layernorm_sp.initialize_layernorm_sp when
+# SP is truly engaged. Accuracy alone cannot prove the feature ran (a no-op
+# passes too), so the test asserts this line appears in the server startup log.
+LAYERNORM_SP_ENABLED_LINE = "LayerNorm sequence parallelism (SP) ENABLED"
 
 LAYERNORM_SP_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
@@ -71,30 +77,49 @@ class TestNPULayerNormSP(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
 
     def test_a_gsm8k(self):
-        process = popen_launch_server(
-            self.model,
-            self.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=list(LAYERNORM_SP_OTHER_ARGS),
-            env={**os.environ, **LAYERNORM_SP_ENVS},
-        )
-        try:
-            args = SimpleNamespace(
-                num_shots=5,
-                data_path=None,
-                num_questions=200,
-                max_new_tokens=512,
-                parallel=64,
-                host=f"http://{self.url.hostname}",
-                port=int(self.url.port),
+        with tempfile.NamedTemporaryFile(
+            mode="w+", buffering=1, encoding="utf-8", delete=False
+        ) as stdout_file, tempfile.NamedTemporaryFile(
+            mode="w+", buffering=1, encoding="utf-8", delete=False
+        ) as stderr_file:
+            process = popen_launch_server(
+                self.model,
+                self.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=list(LAYERNORM_SP_OTHER_ARGS),
+                env={**os.environ, **LAYERNORM_SP_ENVS},
+                return_stdout_stderr=(stdout_file, stderr_file),
             )
-            metrics = run_eval_few_shot_gsm8k(args)
-            self.assertGreaterEqual(
-                metrics["accuracy"],
-                LAYERNORM_SP_ACCURACY,
-            )
-        finally:
-            kill_process_tree(process.pid)
+            try:
+                args = SimpleNamespace(
+                    num_shots=5,
+                    data_path=None,
+                    num_questions=200,
+                    max_new_tokens=512,
+                    parallel=64,
+                    host=f"http://{self.url.hostname}",
+                    port=int(self.url.port),
+                )
+                metrics = run_eval_few_shot_gsm8k(args)
+                self.assertGreaterEqual(
+                    metrics["accuracy"],
+                    LAYERNORM_SP_ACCURACY,
+                )
+
+                # Prove --enable-layernorm-sp actually engaged (not a no-op that
+                # happens to pass accuracy): the server must have logged the SP
+                # marker during startup.
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                server_log = stdout_file.read() + stderr_file.read()
+                self.assertIn(
+                    LAYERNORM_SP_ENABLED_LINE,
+                    server_log,
+                    "server log missing SP-enabled marker; "
+                    "--enable-layernorm-sp likely did not take effect",
+                )
+            finally:
+                kill_process_tree(process.pid)
 
 
 if __name__ == "__main__":
