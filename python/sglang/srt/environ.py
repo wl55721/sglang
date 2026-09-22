@@ -822,7 +822,6 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
     SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
-    SGLANG_NPU_MEMCACHE_LINKER_DIRECT = EnvStr("device")
 
     # ===================================================================
     # MoRI transport and expert dispatch

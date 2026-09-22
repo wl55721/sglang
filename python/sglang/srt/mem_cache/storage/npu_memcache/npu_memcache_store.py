@@ -52,20 +52,19 @@ _MEMCACHE_CTRL_KEYS = frozenset(
 
 
 def _resolve_layer_direct(get: bool) -> Any:
-    """Resolve the memcache_hybrid ``direct`` flag for layered I/O.
+    """Resolve memcache_hybrid's ``direct`` flag for layered I/O.
 
-    The external-linker path moves KV between on-card (device/HBM) buffers and
-    the remote global pool, so the copy direction defaults to on-card:
-    ``L2G`` for put / ``G2L`` for get. Set ``SGLANG_NPU_MEMCACHE_LINKER_DIRECT``
-    to ``host`` to use host-memory semantics (``H2G`` / ``G2H``) instead, e.g.
-    when the caller supplies host-side buffers.
+    The layered path is only reached by the external linker, which always moves
+    KV between on-card (device/HBM) buffers and the remote global pool. The copy
+    direction is therefore always on-card: ``G2L`` for get / ``L2G`` for put.
+    (Host-memory semantics belong to the ``--hicache-storage-backend
+    npu_memcache`` L2 path, which uses the non-layered ``batch_get_into`` /
+    ``batch_put_from`` APIs instead.)
     """
     try:
         import memcache_hybrid
     except ImportError:
         return None
-    if envs.SGLANG_NPU_MEMCACHE_LINKER_DIRECT.get() == "host":
-        return memcache_hybrid.G2H if get else memcache_hybrid.H2G
     return memcache_hybrid.G2L if get else memcache_hybrid.L2G
 
 
@@ -650,10 +649,8 @@ class NpuMemcacheStore(HiCacheStorage):
         was written via :meth:`batch_put_from_layers`.
 
         ``direct`` selects the copy direction / source memory space of the target
-        buffers. It defaults to on-card (device/HBM) semantics, i.e.
-        ``G2L``, because the external linker moves KV straight from the device
-        pools. Override with ``SGLANG_NPU_MEMCACHE_LINKER_DIRECT=host`` to use
-        host-memory semantics (``G2H``) when the buffers live in host RAM.
+        buffers. It defaults to on-card (device/HBM) semantics, i.e. ``G2L``,
+        because the external linker moves KV straight from the device pools.
 
         Returns True only when every requested layer of every key transferred.
         """
