@@ -51,6 +51,24 @@ _MEMCACHE_CTRL_KEYS = frozenset(
 )
 
 
+def _resolve_layer_direct(get: bool) -> Any:
+    """Resolve the memcache_hybrid ``direct`` flag for layered I/O.
+
+    The external-linker path moves KV between on-card (device/HBM) buffers and
+    the remote global pool, so the copy direction defaults to on-card:
+    ``L2G`` for put / ``G2L`` for get. Set ``SGLANG_NPU_MEMCACHE_LINKER_DIRECT``
+    to ``host`` to use host-memory semantics (``H2G`` / ``G2H``) instead, e.g.
+    when the caller supplies host-side buffers.
+    """
+    try:
+        import memcache_hybrid
+    except ImportError:
+        return None
+    if envs.SGLANG_NPU_MEMCACHE_LINKER_DIRECT.get() == "host":
+        return memcache_hybrid.G2H if get else memcache_hybrid.H2G
+    return memcache_hybrid.G2L if get else memcache_hybrid.L2G
+
+
 @dataclass
 class NpuMemcacheConfig:
     """Merged Memcache LocalConfig/control fields from JSON and ``extra_config``."""
@@ -622,19 +640,31 @@ class NpuMemcacheStore(HiCacheStorage):
         keys: List[str],
         buffer_ptrs_list: List[List[int]],
         sizes_list: List[List[int]],
+        direct: Any = None,
     ) -> bool:
-        """Read per-key layer buffers directly into device memory.
+        """Read per-key layer buffers directly into memory.
 
-        ``memcache_hybrid`` layered contract: one key maps to one or more device
-        buffers (the stored object's layers). ``buffer_ptrs_list``/``sizes_list``
-        are key-major (outer) and layer-major (inner), aligned with how the
-        object was written via :meth:`batch_put_from_layers`.
+        ``memcache_hybrid`` layered contract: one key maps to one or more buffers
+        (the stored object's layers). ``buffer_ptrs_list``/``sizes_list`` are
+        key-major (outer) and layer-major (inner), aligned with how the object
+        was written via :meth:`batch_put_from_layers`.
+
+        ``direct`` selects the copy direction / source memory space of the target
+        buffers. It defaults to on-card (device/HBM) semantics, i.e.
+        ``G2L``, because the external linker moves KV straight from the device
+        pools. Override with ``SGLANG_NPU_MEMCACHE_LINKER_DIRECT=host`` to use
+        host-memory semantics (``G2H``) when the buffers live in host RAM.
 
         Returns True only when every requested layer of every key transferred.
         """
         if not keys:
             return True
-        raw = self.store.batch_get_into_layers(keys, buffer_ptrs_list, sizes_list)
+        raw = self.store.batch_get_into_layers(
+            keys,
+            buffer_ptrs_list,
+            sizes_list,
+            direct=direct if direct is not None else _resolve_layer_direct(get=True),
+        )
         # memcache_hybrid reports 0 on success per key.
         if isinstance(raw, int):
             raw = [raw] * len(keys)
@@ -645,11 +675,21 @@ class NpuMemcacheStore(HiCacheStorage):
         keys: List[str],
         buffer_ptrs_list: List[List[int]],
         sizes_list: List[List[int]],
+        direct: Any = None,
     ) -> bool:
-        """Write each key's object from its per-layer device buffers."""
+        """Write each key's object from its per-layer buffers.
+
+        See :meth:`batch_get_into_layers` for the ``direct`` semantics; the put
+        direction defaults to on-card ``L2G``.
+        """
         if not keys:
             return True
-        raw = self.store.batch_put_from_layers(keys, buffer_ptrs_list, sizes_list)
+        raw = self.store.batch_put_from_layers(
+            keys,
+            buffer_ptrs_list,
+            sizes_list,
+            direct=direct if direct is not None else _resolve_layer_direct(get=False),
+        )
         if isinstance(raw, int):
             raw = [raw] * len(keys)
         return len(raw) == len(keys) and all(int(code) == 0 for code in raw)
