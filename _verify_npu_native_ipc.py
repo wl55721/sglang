@@ -95,14 +95,15 @@ def client_worker(
     ok_dev = bool(tensor.device.type == "npu" and tensor.device.index == expected_device)
     print("[CHECK] client 落在 npu:%d (%s) ->" % (expected_device, "OK" if ok_dev else "MISMATCH"))
 
-    # 同一物理显存校验：零拷贝 IPC 必须映射到 daemon 原张量同一段显存地址。
-    # 仅 index 相等不能证明同物理块（万一 card 上另分配了一块相同形状的复制）。
-    # data_ptr 一致才是"同一物理显存"的直接证据。
-    ptr_ok = bool(int(tensor.data_ptr()) == int(expected_ptr))
-    print("[CHECK] client data_ptr=%s vs daemon data_ptr=%s (%s) ->"
-          % (hex(int(tensor.data_ptr())), hex(int(expected_ptr)),
-             "OK" if ptr_ok else "MISMATCH"))
-    writeback_queue.put(("device", ok_dev and ptr_ok, (str(tensor.device), int(tensor.data_ptr()))))
+    # 跨进程 IPC 的虚拟地址语义：daemon 与 client 是不同进程、各有独立虚拟地址
+    # 空间。同一块物理显存被 IPC 映射到两边时，data_ptr 必然落在各自不同的虚拟
+    # 地址上（这与 CUDA _share_cuda_ 一致）。因此「data_ptr 相等」不是正确判据，
+    # 真正的零拷贝铁证是下面的「写回可见」：client 在共享显存写 12345，daemon
+    # 从自己手里的张量能读到 12345 —— 若是序列化拷贝，两边各持独立内存、互不可见。
+    print("[INFO] client data_ptr=%s   daemon data_ptr=%s"
+          % (hex(int(tensor.data_ptr())), hex(int(expected_ptr))))
+    print("       （跨进程虚拟地址不同是预期的；是否零拷贝以写回可见为准）")
+    writeback_queue.put(("device", ok_dev, (str(tensor.device), int(tensor.data_ptr()))))
 
     # 零拷贝写回验证：原地改写，daemon 应能在同一显存读到
     tensor[0] = 12345.0
@@ -151,10 +152,12 @@ def main() -> int:
 
     print()
     print("=" * 60)
-    if dev_flag and dev_ok and writeback_visible and int(ptr) == daemon_ptr:
+    # 零拷贝以「写回可见」为准：client 在共享显存写 12345，daemon 能读到 12345，
+    # 说明二者映射到同一物理显存。data_ptr 跨进程不同是预期的，不作为失败条件。
+    if dev_flag and dev_ok and writeback_visible:
         print("结论: SUPPORTED —— 原生 NPU reduction 无需 SGLANG_TP_RANK，")
-        print("      靠自描述 device index 落到同一物理卡，且 data_ptr 一致证明零拷贝成立。")
-        print("      => NpuWeightCacheTransportBackend 的自描述设备设计成立。")
+        print("      靠自描述 device index 落到同一物理卡，且写回可见证明")
+        print("      （同一物理显存、真零拷贝）-> NpuWeightCacheTransportBackend 设计成立。")
         return 0
     print("结论: FAILED —— 见上方 CHECK。可能原因：")
     print("  * HDK/CANN 版本低于门槛（需 HDK 25.3.RC1+ / CANN 8.3.RC1+）")
