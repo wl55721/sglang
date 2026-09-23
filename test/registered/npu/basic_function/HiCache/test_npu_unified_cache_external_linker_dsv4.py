@@ -202,7 +202,8 @@ class NpuMemcacheTestServices:
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError(
-                    f"Ascend MemCache MetaService exited with code {self.process.returncode}"
+                    f"Ascend MemCache MetaService exited with code "
+                    f"{self.process.returncode}.\n{self._log_tail()}"
                 )
             if self._probe_services():
                 logger.info("Ascend MemCache MetaService is ready.")
@@ -211,6 +212,16 @@ class NpuMemcacheTestServices:
         raise TimeoutError(
             f"Timed out after {META_SERVICE_SETUP_TIMEOUT}s waiting for Ascend MemCache MetaService"
         )
+
+    def _log_tail(self):
+        if not self._log_path or not os.path.exists(self._log_path):
+            return "(no meta service log)"
+        try:
+            with open(self._log_path, "r", encoding="utf-8", errors="replace") as f:
+                tail = "".join(f.readlines()[-50:]).rstrip()
+            return f"MetaService log ({self._log_path}):\n{tail or '(empty)'}"
+        except OSError as e:
+            return f"(failed to read MetaService log: {e})"
 
     def _probe_services(self):
         # Readiness = the meta/config-store TCP endpoints (or the metrics HTTP
