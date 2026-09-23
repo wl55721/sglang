@@ -167,6 +167,18 @@ class NpuMemcacheTestServices:
         if not os.path.exists(self.config_path):
             raise FileNotFoundError(f"MetaService config not found at {self.config_path}")
 
+        # memcache keeps a node-global lock: only one MetaService may run per host.
+        # If a service is already reachable at the configured endpoints, reuse it
+        # instead of competing with it and tripping the lock (exit code 0 with
+        # "process lock file is locked").
+        if self._probe_services():
+            logger.info(
+                "Reusing already-running Ascend MemCache MetaService from %s",
+                self.config_path,
+            )
+            self.process = None
+            return
+
         cmd = [
             sys.executable,
             "-m",
@@ -201,9 +213,19 @@ class NpuMemcacheTestServices:
         deadline = time.monotonic() + META_SERVICE_SETUP_TIMEOUT
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
+                tail = self._log_tail()
+                if tail and "process lock file is locked" in tail:
+                    raise RuntimeError(
+                        "An Ascend MemCache MetaService is already running on this "
+                        "host (memcache uses a node-global lock allowing only one). "
+                        "Either stop the existing MetaService, or point "
+                        "SGLANG_HICACHE_MEMCACHE_CONFIG_PATH at its config so the "
+                        "test reuses it instead of launching a competing one.\n"
+                        f"{tail}"
+                    )
                 raise RuntimeError(
                     f"Ascend MemCache MetaService exited with code "
-                    f"{self.process.returncode}.\n{self._log_tail()}"
+                    f"{self.process.returncode}.\n{tail}"
                 )
             if self._probe_services():
                 logger.info("Ascend MemCache MetaService is ready.")
