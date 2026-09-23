@@ -29,6 +29,16 @@ register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 # load path actually ran (and did not silently fall back to disk).
 STDOUT_FILENAME = "/tmp/test_npu_weight_cache_stdout.log"
 STDERR_FILENAME = "/tmp/test_npu_weight_cache_stderr.log"
+# Capture the daemon's own logs too so test_daemon_served_via_npu_ipc can assert
+# the daemon genuinely served a fetch_state request over the NPU transport
+# (proving a real client<->daemon handshake, not the client merely loading over
+# IPC in isolation).
+DAEMON_STDERR_FILENAME = "/tmp/test_npu_weight_cache_daemon_stderr.log"
+
+# Daemon-side log marker emitted only when it serves a fetch_state request via
+# the NPU transport backend. Absence means the daemon never handed out handles
+# to this client, so the "IPC load" on the client side would be suspect.
+DAEMON_SERVED_MARKER = "via npu_ipc transport"
 
 PROMPTS = [
     "The capital of France is",
@@ -65,7 +75,10 @@ class TestNpuWeightCacheDaemon(CustomTestCase):
                     os.unlink(path)
 
         # Step 1: Launch the weight cache daemon (blocks until one rank is ready,
-        # then serves the exported handles over the weight-cache socket).
+        # then serves the exported handles over the weight-cache socket). Capture
+        # its stderr so test_daemon_served_via_npu_ipc can assert the daemon
+        # actually served handles to the client.
+        cls.daemon_stderr = open(DAEMON_STDERR_FILENAME, "w")
         cls.daemon_process = subprocess.Popen(
             [
                 sys.executable,
@@ -75,7 +88,8 @@ class TestNpuWeightCacheDaemon(CustomTestCase):
                 cls.model,
                 "--tp-size",
                 str(cls.tp_size),
-            ]
+            ],
+            stderr=cls.daemon_stderr,
         )
 
         # Step 2: Wait for the daemon ready file
@@ -122,13 +136,21 @@ class TestNpuWeightCacheDaemon(CustomTestCase):
             kill_process_tree(cls.process.pid)
         if hasattr(cls, "daemon_process") and cls.daemon_process:
             kill_process_tree(cls.daemon_process.pid)
-        for stream in (getattr(cls, "stdout", None), getattr(cls, "stderr", None)):
+        for stream in (
+            getattr(cls, "stdout", None),
+            getattr(cls, "stderr", None),
+            getattr(cls, "daemon_stderr", None),
+        ):
             if stream is not None:
                 try:
                     stream.close()
                 except OSError:
                     pass
-        for path in (STDOUT_FILENAME, STDERR_FILENAME):
+        for path in (
+            STDOUT_FILENAME,
+            STDERR_FILENAME,
+            DAEMON_STDERR_FILENAME,
+        ):
             if os.path.exists(path):
                 try:
                     os.unlink(path)
@@ -184,6 +206,34 @@ class TestNpuWeightCacheDaemon(CustomTestCase):
             logs,
             "Expected the client server to load weights via IPC, but the IPC "
             "load log line was not found — the loader likely fell back to disk.",
+        )
+
+    def test_daemon_served_via_npu_ipc(self):
+        """Assert the daemon itself served a fetch_state over the NPU transport.
+
+        ``test_loaded_via_ipc`` proves the *client* took the IPC load path, but
+        alone it can't rule out the client loading over IPC while a stale/absent
+        daemon never participated. This closes the loop on the other end: the
+        daemon only emits the marker when it serves tensors via
+        ``NpuIpcTransportBackend`` (name ``npu_ipc``), so its presence proves a
+        real client<->daemon handshake over the NPU transport happened.
+        """
+        if getattr(self, "daemon_stderr", None) is not None:
+            try:
+                self.daemon_stderr.flush()
+            except OSError:
+                pass
+        logs = ""
+        if os.path.exists(DAEMON_STDERR_FILENAME):
+            with open(DAEMON_STDERR_FILENAME, errors="replace") as f:
+                logs += f.read()
+        self.assertIn(
+            DAEMON_SERVED_MARKER,
+            logs,
+            "Expected the weight cache daemon to serve fetch_state via the "
+            f"NPU transport (marker {DAEMON_SERVED_MARKER!r}), but the daemon "
+            "log did not contain it — the daemon never handed handles to the "
+            "client, so the IPC path is not actually end-to-end.",
         )
 
 
