@@ -489,6 +489,13 @@ class NpuMemcacheStore(HiCacheStorage):
             # (k_ptr, v_ptr) order of get_page_buffer_meta.
             base_suffix = f"_{self.mha_suffix}"
             suffixes = [f"{base_suffix}_k", f"{base_suffix}_v"]
+        elif isinstance(name, PoolName) and name.value.startswith("deepseek_v4_"):
+            # DSV4 compressed-KV / indexer sidecars, all rank-replicated objects
+            # derived from the FULL/KV transfer (indices_from_pool=KV in the
+            # linker pool group). Like the KV pool itself, each holds every
+            # transfer layer for the page in one object: one ``_k``-style key
+            # per page, named after the pool's short tag.
+            suffixes = [f"_{self.mla_suffix}_{name.value}"]
         else:
             raise ValueError(f"Unsupported hybrid pool for batch v2 I/O: {name}")
         if not suffixes:

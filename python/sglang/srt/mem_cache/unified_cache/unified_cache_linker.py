@@ -54,6 +54,11 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        # DSV4 keeps a C128 compression sidecar as a tree component. Its pools
+        # are derived from the FULL/KV transfer (indices_from_pool=KV) in the
+        # pool group, so it does not produce its own linker transfer; it is
+        # excluded from the per-component loop below.
+        ComponentType.C128,
     }
 )
 
@@ -165,10 +170,15 @@ class UnifiedCacheLinkerWrapper:
         self._skip_swa = swa is not None and is_swa_req_ring(
             cache.token_to_kv_pool_allocator
         )
+        # DSV4's C128 sidecar pools are derived from the KV transfer by the
+        # pool group (indices_from_pool=KV), not as standalone linker transfers,
+        # so the C128 component is skipped here like a skipped SWA.
+        c128 = cache.components.get(ComponentType.C128)
         self._components = tuple(
             component
             for component in cache._components_tuple
             if not (self._skip_swa and component is swa)
+            and component is not c128
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
