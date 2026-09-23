@@ -69,8 +69,9 @@ def client_worker(
     tensor_queue: MpQueue,
     writeback_queue: MpQueue,
     expected_device: int,
+    expected_ptr: int,
 ) -> None:
-    """client 侧：取句柄 -> 原生重建 -> 校验设备落点 -> 原地写回验证零拷贝。
+    """client 侧：取句柄 -> 原生重建 -> 校验设备/指针落点 -> 原地写回验证零拷贝。
 
     刻意不调用 monkey_patch_torch_reductions，也不读 SGLANG_TP_RANK，
     只用 torch.multiprocessing.reductions 在 daemon 侧生成的 (fn, args)。
@@ -93,25 +94,35 @@ def client_worker(
     # 设备落点校验：应落到句柄自描述的卡
     ok_dev = bool(tensor.device.type == "npu" and tensor.device.index == expected_device)
     print("[CHECK] client 落在 npu:%d (%s) ->" % (expected_device, "OK" if ok_dev else "MISMATCH"))
-    writeback_queue.put(("device", ok_dev, str(tensor.device)))
+
+    # 同一物理显存校验：零拷贝 IPC 必须映射到 daemon 原张量同一段显存地址。
+    # 仅 index 相等不能证明同物理块（万一 card 上另分配了一块相同形状的复制）。
+    # data_ptr 一致才是"同一物理显存"的直接证据。
+    ptr_ok = bool(int(tensor.data_ptr()) == int(expected_ptr))
+    print("[CHECK] client data_ptr=%s vs daemon data_ptr=%s (%s) ->"
+          % (hex(int(tensor.data_ptr())), hex(int(expected_ptr)),
+             "OK" if ptr_ok else "MISMATCH"))
+    writeback_queue.put(("device", ok_dev and ptr_ok, (str(tensor.device), int(tensor.data_ptr()))))
 
     # 零拷贝写回验证：原地改写，daemon 应能在同一显存读到
     tensor[0] = 12345.0
     torch.npu.synchronize()
-    writeback_queue.put(("writeback_done", True, None))
 
 
 def main() -> int:
-    dev_id = 0  # 目标物理卡；如需改成 daemon 所用的卡号
+    # 目标物理卡：取当前环境可用卡，而非硬编码 0（多卡 NPU 机上 daemon 未必是 0 号）。
+    dev_id = torch.npu.current_device()
     print(f"[daemon] 使用 npu:{dev_id} 构造张量并导出句柄")
 
     # 在 daemon 侧造张量（先确保 set_device 与句柄一致）
     torch.npu.set_device(dev_id)
     t = torch.full((8,), 1.0, device=f"npu:{dev_id}", dtype=torch.float32)
+    daemon_ptr = int(t.data_ptr())
+    print(f"[daemon] 原张量 data_ptr = {hex(daemon_ptr)}")
 
     tq: MpQueue = ctx.Queue()
     wq: MpQueue = ctx.Queue()
-    proc = ctx.Process(target=client_worker, args=(tq, wq, dev_id))
+    proc = ctx.Process(target=client_worker, args=(tq, wq, dev_id, daemon_ptr))
     proc.start()
 
     # daemon 侧用原生 reduction 导出（不用 sglang 的 MultiprocessingSerializer）
@@ -120,14 +131,13 @@ def main() -> int:
     tq.put(handle)
 
     # 等 client 反馈
-    dev_flag = dev_ok = writeback_ok = False
-    dev_str, wb_detail = None, None
-    for _ in range(2):
-        kind, ok, detail = wq.get(timeout=30)
-        if kind == "device":
-            dev_flag, dev_ok, dev_str = True, ok, detail
-        elif kind == "writeback_done":
-            writeback_ok = bool(ok)
+    dev_flag = dev_ok = False
+    dev_str, ptr = None, None
+    kind, ok, detail = wq.get(timeout=30)
+    if kind == "device":
+        dev_flag, dev_ok, dev_str, ptr = True, ok, detail[0], detail[1]
+    elif kind == "writeback_done":
+        print("[WARN] 收到旧协议消息，忽略")
 
     proc.join(timeout=10)
     if proc.is_alive():
@@ -141,9 +151,9 @@ def main() -> int:
 
     print()
     print("=" * 60)
-    if dev_flag and dev_ok and writeback_ok and writeback_visible:
+    if dev_flag and dev_ok and writeback_visible and int(ptr) == daemon_ptr:
         print("结论: SUPPORTED —— 原生 NPU reduction 无需 SGLANG_TP_RANK，")
-        print("      靠自描述 device index 即可落到同一物理卡，零拷贝成立。")
+        print("      靠自描述 device index 落到同一物理卡，且 data_ptr 一致证明零拷贝成立。")
         print("      => NpuWeightCacheTransportBackend 的自描述设备设计成立。")
         return 0
     print("结论: FAILED —— 见上方 CHECK。可能原因：")
