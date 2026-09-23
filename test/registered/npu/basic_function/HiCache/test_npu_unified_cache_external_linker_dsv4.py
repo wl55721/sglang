@@ -321,6 +321,7 @@ class TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL(
                     str(cls.tp_size),
                     "--attention-backend",
                     "dsv4",
+                    "--disable-cuda-graph",
                     "--quantization",
                     "modelslim",
                     "--page-size",
