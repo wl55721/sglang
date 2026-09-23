@@ -102,10 +102,19 @@ class NpuMemcacheConfig:
     def apply_to_local_config(self, local_cfg: Any) -> List[str]:
         unknown: List[str] = []
         for key, value in self.local_fields.items():
-            if hasattr(local_cfg, key):
-                setattr(local_cfg, key, value)
-            else:
+            if not hasattr(local_cfg, key):
                 unknown.append(key)
+                continue
+            try:
+                setattr(local_cfg, key, value)
+            except (TypeError, ValueError):
+                # Some pybind-typed setters (e.g. the size fields dram_size /
+                # hbm_size / max_dram_size / max_hbm_size) only accept a string
+                # argument, while configs may supply an integer. Retry as str.
+                try:
+                    setattr(local_cfg, key, str(value))
+                except (TypeError, ValueError):
+                    unknown.append(key)
         return unknown
 
 
