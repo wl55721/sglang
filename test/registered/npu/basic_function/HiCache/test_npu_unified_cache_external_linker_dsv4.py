@@ -447,5 +447,94 @@ class TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL(
         self._run_linker_kl_case(super().test_multiturn_decode_cache_hit_branching)
 
 
+class TestNpuDeepSeekV4FlashPrefillControl(CustomTestCase):
+    """对照组：不带 external-linker，判定 prefill 设备挂起是否由 linker 引入。
+
+    py-spy 显示 DSV4 prefill 在 NPU 上出现主计算流设备级挂起（卡在任意 D2H
+    同步点，如 ``.item()`` / ``.cpu()``）。本用例复用同一套启动参数但**去掉**
+    ``--enable-unified-cache-external-linker`` 两个标志，发一个普通 prefill：
+
+    - 若在 ``request_timeout`` 内成功返回 → 挂起来自 external-linker 加载路径，
+      去查 ``batch_get_into_layers`` / ``_load_one_layer`` 的流/DMA。
+    - 若超时（requests 抛 Timeout / 返回非 200）→ 与 linker 无关，是 DSV4 prefill
+      自身的设备级问题。
+
+    注意：这是判别用用例，与 linker 用例互斥（各占 16 卡），逐个单独运行。
+    """
+
+    tp_size = 16
+    # 首个 prefill 请求的等待上限；超时判为设备挂起（watchdog 同样的症状）。
+    request_timeout = 300
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
+        cls.base_url = f"http://127.0.0.1:{find_available_port(30000)}"
+        cls.process = None
+        try:
+            # 对照组：故意不传 --enable-unified-cache-external-linker（及 backend）。
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DSV4_FLASH_LAUNCH_TIMEOUT,
+                other_args=[
+                    "--trust-remote-code",
+                    "--device",
+                    "npu",
+                    "--tp-size",
+                    str(cls.tp_size),
+                    "--attention-backend",
+                    "dsv4",
+                    "--disable-cuda-graph",
+                    "--quantization",
+                    "modelslim",
+                    "--page-size",
+                    str(TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL.page_size),
+                    "--chunked-prefill-size",
+                    "8192",
+                    "--mem-fraction-static",
+                    "0.62",
+                    "--disable-shared-experts-fusion",
+                    "--swa-full-tokens-ratio",
+                    "0.25",
+                    "--max-total-tokens",
+                    "8192",
+                    "--max-running-requests",
+                    "1",
+                    "--enable-cache-report",
+                ],
+                env=DEEPSEEK_V4_FLASH_W8A8_ENVS,
+                device="npu",
+            )
+        except Exception:
+            cls._cleanup()
+            raise
+
+    @classmethod
+    def _cleanup(cls):
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
+            cls.process = None
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._cleanup()
+
+    def test_control_prefill_responsive(self):
+        """首个普通 prefill 须在 request_timeout 内返回，否则判定设备挂起。"""
+        try:
+            r = requests.post(
+                f"{self.base_url}/generate",
+                json={"text": "The capital of France is", "max_new_tokens": 16},
+                timeout=self.request_timeout,
+            )
+        except requests.RequestException as exc:
+            self.fail(
+                "control prefill did not return within "
+                f"{self.request_timeout}s (main compute stream wedge?): {exc}"
+            )
+        self.assertEqual(r.status_code, 200, r.text)
+
+
 if __name__ == "__main__":
     unittest.main()
