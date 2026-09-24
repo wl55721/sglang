@@ -194,6 +194,16 @@ class CompressorAscendBackendMixin:
         if _verify_compress:
             n_draft = int(forward_batch.spec_info.draft_token_num)
             _seq_lens = _seq_lens + n_draft
+        # Derive seq_lens_max from the CPU mirror (as the graph path does via
+        # seq_lens_max_override) instead of seq_lens.max().item(), which is a
+        # blocking D2H sync that can wedge the eager prefill/decode metadata path.
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        seq_lens_max_override = None
+        if seq_lens_cpu is not None and seq_lens_cpu.numel():
+            sl_cpu = seq_lens_cpu[: forward_batch.batch_size].to(torch.int32)
+            if _verify_compress:
+                sl_cpu = sl_cpu + n_draft
+            seq_lens_max_override = int(sl_cpu.max())
         result = self._compute_compress_locs(
             pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -205,6 +215,7 @@ class CompressorAscendBackendMixin:
             device=forward_batch.seq_lens.device,
             req_to_token_pool=self.req_to_token_pool,
             out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
+            seq_lens_max_override=seq_lens_max_override,
         )
         for k, v in result.items():
             setattr(fm, k, v)
