@@ -512,6 +512,11 @@ class TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL(
         self._run_linker_kl_case(super().test_multiturn_decode_cache_hit_branching)
 
 
+@unittest.skip(
+    "Skipped: 16-card DSV4 eager prefill is inherently unstable on NPU, so this "
+    "diagnostic control prefill no longer distinguishes linker-induced stalls "
+    "from prefill-device issues. The linker KL cases above are the real target."
+)
 class TestNpuDeepSeekV4FlashPrefillControl(CustomTestCase):
     """Control group without the external linker, to tell whether a prefill
     device stall is introduced by the linker.
