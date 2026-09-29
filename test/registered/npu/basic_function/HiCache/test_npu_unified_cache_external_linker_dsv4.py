@@ -54,16 +54,18 @@ DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 META_SERVICE_SETUP_TIMEOUT = 300
 
 
-def kill_process_tree(pid: int) -> None:
+def kill_process_tree(proc) -> None:
     """Recursively terminate a server process and its entire process group.
 
-    deepep + DP attention forks many worker subprocesses (scheduler_DP*_TP*,
-    model_runner, HCCL communication helpers) that share the parent's process
-    group. Killing only the parent leaks those subprocesses and their NPU/HCCL
-    resources, which can wedge the next 16-card testcase's prefill D2H sync. We
-    therefore signal the whole process group first, then the pid directly as a
-    fallback.
+    Accepts either a ``subprocess.Popen`` object or an integer pid. deepep + DP
+    attention forks many worker subprocesses (scheduler_DP*_TP*, model_runner,
+    HCCL communication helpers) that share the parent's process group. Killing
+    only the parent leaks those subprocesses and their NPU/HCCL resources, which
+    can wedge the next 16-card testcase's prefill D2H sync and cause residual
+    NPU memory to OOM later. We therefore signal the whole process group first,
+    then the pid directly as a fallback.
     """
+    pid = proc.pid if hasattr(proc, "pid") else proc
     if pid is None:
         return
     try:
