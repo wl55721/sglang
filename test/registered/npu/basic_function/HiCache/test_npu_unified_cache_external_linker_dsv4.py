@@ -449,7 +449,8 @@ class TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL(
             cls.input_ids = get_input_ids(cls.model, num_samples=18)
         except Exception:
             try:
-                terminate_and_kill_process_tree(cls.process)
+                if cls.process is not None:
+                    terminate_and_kill_process_tree(cls.process)
             finally:
                 cls.memcache.stop()
             raise
@@ -457,7 +458,8 @@ class TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL(
     @classmethod
     def tearDownClass(cls):
         try:
-            terminate_and_kill_process_tree(cls.process)
+            if cls.process is not None:
+                terminate_and_kill_process_tree(cls.process)
         finally:
             cls.memcache.stop()
 
