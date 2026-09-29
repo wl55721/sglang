@@ -165,12 +165,57 @@ class NpuMemcacheTestServices:
     def config_store_url(self):
         return self._config.get("config_store_url", "tcp://127.0.0.1:6000")
 
+    @staticmethod
+    def _discover_running_meta_service_config():
+        """Return the ``--config_path`` of a start_meta_service already running on
+        this host, or None.
+
+        The node-global lock lives inside memcache_hybrid's C++ layer, so it cannot
+        be read from Python. When no explicit config is provided we instead discover
+        an already-running MetaService from the process table and reuse its config.
+        Reusing is the only way to avoid tripping the lock with a competing instance
+        that was started with different (random) ports.
+        """
+        try:
+            out = subprocess.run(
+                ["ps", "-eo", "pid,args"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        for line in out.splitlines():
+            if "start_meta_service" not in line or "--config_path" not in line:
+                continue
+            tokens = line.split()
+            for i, tok in enumerate(tokens):
+                if tok == "--config_path" and i + 1 < len(tokens):
+                    path = tokens[i + 1].strip()
+                    if path.startswith("http") or not os.path.exists(path):
+                        continue
+                    return path
+        return None
+
     def start(self):
         if not self.config_path:
             logger.info(
                 "SGLANG_HICACHE_MEMCACHE_CONFIG_PATH is unset; generating a local "
                 "single-node MemCache config."
             )
+            existing = self._discover_running_meta_service_config()
+            if existing is not None:
+                # A MetaService is already running on this host (node-global lock
+                # allows only one). Reuse its config so this test connects to it
+                # instead of launching a competing instance and tripping the lock.
+                logger.info(
+                    "Reusing already-running Ascend MemCache MetaService config %s",
+                    existing,
+                )
+                self.config_path = existing
+                self._owned_config_path = None
+                self.process = None
+                return
             self.config_path = self._generate_default_config()
             self._owned_config_path = self.config_path
         if not os.path.exists(self.config_path):
