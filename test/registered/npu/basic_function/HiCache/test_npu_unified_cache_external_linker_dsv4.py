@@ -59,13 +59,17 @@ DEFAULT_MEMCACHE_PROTOCOL = "device_sdma"
 DEFAULT_MEMCACHE_DRAM_SIZE = "1GB"
 DEFAULT_MEMCACHE_WORLD_SIZE = 256
 
-# Minimal env set to load DeepSeek-V4-Flash W8A8 (modelslim) on NPU without
-# MTP/deepep. The SGLANG_OPT_* flags disable CUDA/ROCm fast-paths whose quantized
-# layouts do not match the modelslim W8A8 checkpoint; without them the model
-# fails to load (e.g. wq_a/wkv fused-path dtype mismatch). Aligned with the
-# accuracy suite's "skip gpu branch" env block.
+# Minimal env set to load DeepSeek-V4-Flash W8A8 (modelslim) on NPU with
+# deepep + DP attention. DeepSeek-V4-Flash requires DP attention at tp_size=16
+# (attn_tp_size collapses to 1), otherwise the sparse o_proj if reshaped by
+# n_local_groups = o_groups // attn_tp_size -> 0 and forward crashes. The
+# SGLANG_OPT_* flags disable CUDA/ROCm fast-paths whose quantized layouts do not
+# match the modelslim W8A8 checkpoint; without them the model fails to load
+# (e.g. wq_a/wkv fused-path dtype mismatch). Aligned with the accuracy suite's
+# "skip gpu branch" env block and its deepep env.
 DEEPSEEK_V4_FLASH_W8A8_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
@@ -79,6 +83,11 @@ DEEPSEEK_V4_FLASH_W8A8_ENVS = {
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+    # deepep
+    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    "DEEPEP_HCCL_BUFFSIZE": "2048",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
 }
 
 register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
@@ -357,6 +366,17 @@ class TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL(
                     "--disable-cuda-graph",
                     "--quantization",
                     "modelslim",
+                    # DeepSeek-V4-Flash requires DP attention at tp_size=16
+                    # (attn_tp_size collapses to 1); pure TP crashes in the sparse
+                    # o_proj reshape. Aligned with the accuracy/perf testcases.
+                    "--dp-size",
+                    str(cls.tp_size),
+                    "--enable-dp-attention",
+                    "--enable-dp-lm-head",
+                    "--moe-a2a-backend",
+                    "deepep",
+                    "--deepep-mode",
+                    "auto",
                     "--page-size",
                     str(cls.page_size),
                     "--chunked-prefill-size",
@@ -448,22 +468,27 @@ class TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL(
 
 
 class TestNpuDeepSeekV4FlashPrefillControl(CustomTestCase):
-    """对照组：不带 external-linker，判定 prefill 设备挂起是否由 linker 引入。
+    """Control group without the external linker, to tell whether a prefill
+    device stall is introduced by the linker.
 
-    py-spy 显示 DSV4 prefill 在 NPU 上出现主计算流设备级挂起（卡在任意 D2H
-    同步点，如 ``.item()`` / ``.cpu()``）。本用例复用同一套启动参数但**去掉**
-    ``--enable-unified-cache-external-linker`` 两个标志，发一个普通 prefill：
+    py-spy shows DSV4 prefill stalling at the device level on NPU's main compute
+    stream (stuck at any D2H sync point, e.g. ``.item()`` / ``.cpu()``). This case
+    reuses the same launch config as the linker case but **drops** the two
+    ``--enable-unified-cache-external-linker`` flags and issues one plain prefill:
 
-    - 若在 ``request_timeout`` 内成功返回 → 挂起来自 external-linker 加载路径，
-      去查 ``batch_get_into_layers`` / ``_load_one_layer`` 的流/DMA。
-    - 若超时（requests 抛 Timeout / 返回非 200）→ 与 linker 无关，是 DSV4 prefill
-      自身的设备级问题。
+    - If it returns within ``request_timeout`` -> the stall comes from the
+      external-linker load path; inspect ``batch_get_into_layers`` /
+      ``_load_one_layer`` streams/DMA.
+    - If it times out (requests raises Timeout or returns non-200) -> unrelated to
+      the linker; it is a DSV4 prefill device-level issue.
 
-    注意：这是判别用用例，与 linker 用例互斥（各占 16 卡），逐个单独运行。
+    Note: this is a diagnostic case and is mutually exclusive with the linker case
+    (each uses 16 cards); run them one at a time.
     """
 
     tp_size = 16
-    # 首个 prefill 请求的等待上限；超时判为设备挂起（watchdog 同样的症状）。
+    # Max wait for the first prefill request; on timeout the device is considered
+    # stalled (same symptom the watchdog reports).
     request_timeout = 300
 
     @classmethod
@@ -472,7 +497,9 @@ class TestNpuDeepSeekV4FlashPrefillControl(CustomTestCase):
         cls.base_url = f"http://127.0.0.1:{find_available_port(30000)}"
         cls.process = None
         try:
-            # 对照组：故意不传 --enable-unified-cache-external-linker（及 backend）。
+            # Control group: intentionally omits --enable-unified-cache-external-linker
+            # (and its backend), but keeps DP attention + deepep so the DSV4-Flash
+            # model can run at tp_size=16 in the first place.
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -488,6 +515,14 @@ class TestNpuDeepSeekV4FlashPrefillControl(CustomTestCase):
                     "--disable-cuda-graph",
                     "--quantization",
                     "modelslim",
+                    "--dp-size",
+                    str(cls.tp_size),
+                    "--enable-dp-attention",
+                    "--enable-dp-lm-head",
+                    "--moe-a2a-backend",
+                    "deepep",
+                    "--deepep-mode",
+                    "auto",
                     "--page-size",
                     str(TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL.page_size),
                     "--chunked-prefill-size",
@@ -521,7 +556,8 @@ class TestNpuDeepSeekV4FlashPrefillControl(CustomTestCase):
         cls._cleanup()
 
     def test_control_prefill_responsive(self):
-        """首个普通 prefill 须在 request_timeout 内返回，否则判定设备挂起。"""
+        """The first plain prefill must return within request_timeout, otherwise
+        the device is considered stalled."""
         try:
             r = requests.post(
                 f"{self.base_url}/generate",
