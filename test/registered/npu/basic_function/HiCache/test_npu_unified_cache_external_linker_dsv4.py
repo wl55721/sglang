@@ -23,6 +23,7 @@ import importlib.util
 import json
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -51,6 +52,28 @@ logger = logging.getLogger(__name__)
 
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 META_SERVICE_SETUP_TIMEOUT = 300
+
+
+def kill_process_tree(pid: int) -> None:
+    """Recursively terminate a server process and its entire process group.
+
+    deepep + DP attention forks many worker subprocesses (scheduler_DP*_TP*,
+    model_runner, HCCL communication helpers) that share the parent's process
+    group. Killing only the parent leaks those subprocesses and their NPU/HCCL
+    resources, which can wedge the next 16-card testcase's prefill D2H sync. We
+    therefore signal the whole process group first, then the pid directly as a
+    fallback.
+    """
+    if pid is None:
+        return
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 # Defaults used when the test generates its own local MetaService config because
 # SGLANG_HICACHE_MEMCACHE_CONFIG_PATH is unset. Override via the SGLANG_NPU_MEMCACHE_*
@@ -449,8 +472,7 @@ class TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL(
             cls.input_ids = get_input_ids(cls.model, num_samples=18)
         except Exception:
             try:
-                if cls.process is not None:
-                    terminate_and_kill_process_tree(cls.process)
+                kill_process_tree(cls.process)
             finally:
                 cls.memcache.stop()
             raise
@@ -458,8 +480,7 @@ class TestNpuDeepSeekV4FlashUnifiedCacheLinkerKL(
     @classmethod
     def tearDownClass(cls):
         try:
-            if cls.process is not None:
-                terminate_and_kill_process_tree(cls.process)
+            kill_process_tree(cls.process)
         finally:
             cls.memcache.stop()
 
@@ -592,9 +613,8 @@ class TestNpuDeepSeekV4FlashPrefillControl(CustomTestCase):
 
     @classmethod
     def _cleanup(cls):
-        if cls.process is not None:
-            terminate_and_kill_process_tree(cls.process)
-            cls.process = None
+        kill_process_tree(cls.process)
+        cls.process = None
 
     @classmethod
     def tearDownClass(cls):
