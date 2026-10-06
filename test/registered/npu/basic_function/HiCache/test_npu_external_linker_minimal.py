@@ -76,11 +76,9 @@ DEEPSEEK_V4_FLASH_W8A8_ENVS = {
     # Avoid device-stream wedge when the direct linker does DMA collide with the
     # compute stream during prefill offload (cold prefill works without the linker,
     # hangs with it). Turn off layer-wise overlap, a known mitigation for this.
+    # NOTE: read directly by the direct linker via os.getenv, so it belongs in the
+    # server process env below.
     "SGLANG_NPU_MEMCACHE_LINKER_LAYERWISE": "0",
-    # Route offload/load through the host instead of device_sdma: the device-side
-    # DMA transfer competes with the compute stream and wedges the NPU during the
-    # first KV put (timeout). host_shm keeps the transfer off the device DMA path.
-    "SGLANG_NPU_MEMCACHE_LINKER_PROTOCOL": "host_shm",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
@@ -321,6 +319,13 @@ class TestNpuExternalLinkerMinimal(CustomTestCase):
     def setUpClass(cls):
         if not _MemcacheServices.is_available():
             raise unittest.SkipTest("memcache_hybrid is not installed")
+        # The MemCache config's ``protocol`` field is read by _generate_config()
+        # from THIS (pytest) process's os.environ, not from the server env dict
+        # passed to popen_launch_server. Setting it here (before start()) is what
+        # actually overrides device_sdma. host_shm keeps offload/load off the
+        # device DMA path to avoid the prefill stream wedge; override externally
+        # via SGLANG_NPU_MEMCACHE_LINKER_PROTOCOL to try host_rdma/device_sdma.
+        os.environ.setdefault("SGLANG_NPU_MEMCACHE_LINKER_PROTOCOL", "host_shm")
         cls.memcache = _MemcacheServices()
         cls.memcache.start()
 
