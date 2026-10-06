@@ -352,6 +352,12 @@ class TestNpuExternalLinkerMinimal(CustomTestCase):
                 "--mem-fraction-static",
                 "0.62",
                 "--enable-cache-report",
+                # Skip the server warmup run: under DP=16 the warmup generation
+                # request stalls (unstable HCCL/comm ports), so server_status stays
+                # ServerStatus.Starting and /health_generate returns 503 forever.
+                # Skipping it sets server_status to Up immediately (http_server.py
+                # launches warmup only when skip_server_warmup is False).
+                "--skip-server-warmup",
                 "--enable-unified-cache-external-linker",
                 "--unified-cache-external-linker-backend",
                 "npu_memcache",
