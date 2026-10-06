@@ -68,6 +68,11 @@ DEEPSEEK_V4_FLASH_W8A8_ENVS = {
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+    # Stop /health_generate from issuing a real one-token generation probe. Under
+    # DP=16 that probe stalls (unstable HCCL/comm ports) and flips the server into
+    # ServerStatus.UnHealthy with a persistent 503; bypassing it makes health return
+    # 200 so the driver can issue its own /generate requests.
+    "SGLANG_DIAG_BYPASS_HEALTH_GENERATE": "1",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
