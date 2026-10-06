@@ -4,9 +4,10 @@ Purpose: unlike the full KL suite (which stresses decode cache-hit branching and
 hit DP=16 ``all_gather`` deadlocks), this test only proves on DeepSeek-V4-Flash W8A8
 that KV actually gets loaded back from an Ascend MemCache through the
 ``--unified-cache-external-linker`` direct linker. It self-launches a MetaService,
-starts the server with the linker enabled, warms the same prefix twice, and asserts
-the 2nd request reports ``cached_tokens_details["host"] > 0`` (tokens pulled from the
-remote MemCache).
+starts the server with the linker enabled, warms a multi-page prefix twice (the 2nd
+hit triggers the lazy write-through offload), flushes the device radix tree, and
+asserts a 3rd request reports ``cached_tokens_details["host"] > 0`` (tokens pulled
+back from the remote MemCache).
 
 Run:
     python3 -m pytest test/registered/npu/basic_function/HiCache/\
@@ -46,6 +47,58 @@ logger = logging.getLogger(__name__)
 
 DSV4_FLASH_LAUNCH_TIMEOUT = 1800
 META_SERVICE_SETUP_TIMEOUT = 300
+
+# The radix tree only caches page-aligned prefixes (`page_size` = 256, configured
+# below). A prompt shorter than one page is truncated to 0 tokens by
+# `RadixKey.page_aligned(256)`, so nothing is ever inserted, offloaded, or loaded
+# back. This prompt is several pages of English prose so the device KV for a whole
+# page (several pages, really) is cached and offloaded. The exact token count is
+# model-tokenizer dependent; this is comfortably above 2 pages for every common
+# English tokenizer.
+PROMPT_LONG = (
+    "A large language model is a statistical system trained on a very large "
+    "corpus of text drawn from the public internet. During training the model "
+    "learns to predict the next token in a sequence given the tokens that came "
+    "before it. This simple objective, repeated across trillions of tokens, is "
+    "enough to produce a system that can answer questions, summarize documents, "
+    "translate between languages, write computer programs, and follow complex "
+    "multi-step instructions. The model represents text as a sequence of tokens, "
+    "where each token is a short fragment of text, typically a few characters or "
+    "a single word. The Transformer architecture processes the whole sequence in "
+    "parallel using the attention mechanism, which lets every position attend to "
+    "every other position according to a learned similarity score. The attention "
+    "score for a pair of positions is computed as a dot product between a query "
+    "vector derived from one position and a key vector derived from the other, "
+    "followed by a softmax normalization and a weighted sum over value vectors. "
+    "In practice the computation is split into many attention heads so that the "
+    "model can track different kinds of relationship in parallel. The output of "
+    "each layer is added to its input through a residual connection and passed "
+    "through layer normalization, which keeps the activations on a stable scale. "
+    "All of these layers are stacked deeply, and the final layer produces a "
+    "distribution over the vocabulary from which the next token is sampled. "
+    "Inference proceeds autoregressively: the model generates one token, appends "
+    "it to the sequence, and repeats the process until a stop condition is met. "
+    "To serve these models efficiently, systems cache the intermediate keys and "
+    "values that the attention layers compute, so that repeated computations over "
+    "a shared prefix can be avoided. A radix tree over token sequences is a "
+    "natural data structure for this cache, because it lets the server share the "
+    "cached computation across requests that begin with the same prompt. When a "
+    "request shares a prefix with an earlier request, the server reuses the "
+    "already computed keys and values for the shared part and only computes the "
+    "remainder. This reduces latency and increases throughput for workloads that "
+    "reuse long system prompts or few-shot examples. The keys and values can also "
+    "be moved out of the accelerator memory to CPU memory or to a remote store, "
+    "which is useful when the working set is larger than the local memory. The "
+    "difficulty is that remote memory has higher latency and lower bandwidth, so "
+    "the system must decide carefully which entries to keep locally and which to "
+    "evict. A common policy is write-through caching, in which an entry is copied "
+    "to the remote store once it has been accessed enough times to justify the "
+    "cost of the transfer. This describes the general design of the feature that "
+    "this test exercises on the NPU, and the paragraph is intentionally long so "
+    "that the prompt spans multiple cache pages and triggers a real offload of "
+    "the cached keys and values to the remote memory store, followed by a load "
+    "back from the remote store after the local cache has been flushed."
+)
 
 # Aligned with the CI case's DSV4 W8A8 env block and its deepep + DP attention env.
 # DeepSeek-V4-Flash needs DP attention at tp_size=16 (attn_tp_size collapses to 1),
@@ -396,34 +449,63 @@ class TestNpuExternalLinkerMinimal(CustomTestCase):
         if getattr(cls, "memcache", None) is not None:
             cls.memcache.stop()
 
-    def test_remote_host_kv_loadback(self):
+    def _generate(self, text):
         payload = {
-            "text": "The capital of France is ",
+            "text": text,
             "max_new_tokens": 8,
             "sampling_params": {"temperature": 0},
         }
-        logger.info("Request 1 (cold / warm into MemCache)...")
-        r1 = requests.post(f"{self.base_url}/generate", json=payload, timeout=300)
-        r1.raise_for_status()
-        meta1 = r1.json()["meta_info"]
+        r = requests.post(f"{self.base_url}/generate", json=payload, timeout=300)
+        r.raise_for_status()
+        meta = r.json()["meta_info"]
+        return meta, meta.get("cached_tokens_details") or {}
+
+    def test_remote_host_kv_loadback(self):
+        # write-through is lazy under the external linker: a prefix node is
+        # offloaded to MemCache only after it has been hit (--page-size 256 makes
+        # the prompt several pages, so plain /generate does insert real nodes).
+        # The reference pattern (flexkv verify_outputs.py) is:
+        #   R1 warm -> R2 hit (backs up to MemCache, async) -> flush device tree
+        #   -> R3 misses device, hits MemCache, loads KV back.
+        logger.info("Request 1 (cold: insert device KV)...")
+        meta1, _ = self._generate(PROMPT_LONG)
         logger.info(
             "req1 cached_tokens=%s details=%s",
             meta1.get("cached_tokens"),
             meta1.get("cached_tokens_details"),
         )
 
-        logger.info("Request 2 (should hit remote MemCache)...")
-        r2 = requests.post(f"{self.base_url}/generate", json=payload, timeout=300)
-        r2.raise_for_status()
-        meta2 = r2.json()["meta_info"]
-        details2 = meta2.get("cached_tokens_details") or {}
-        host_tokens = int(details2.get("host", 0))
+        logger.info("Request 2 (warm: full device hit -> write-through offload)...")
+        meta2, _ = self._generate(PROMPT_LONG)
         logger.info(
-            "req2 cached_tokens=%s cached_tokens_details=%s",
+            "req2 cached_tokens=%s details=%s",
             meta2.get("cached_tokens"),
-            details2,
+            meta2.get("cached_tokens_details"),
         )
-        self.assertGreater(host_tokens, 0, "linker did not load any KV back from MemCache")
+
+        # Let the async offload thread finish the batch_put to MemCache.
+        logger.info("Waiting for async offload to settle...")
+        time.sleep(5)
+
+        logger.info("Flushing device radix tree (MemCache keeps the offloaded KV)...")
+        flush_resp = requests.post(
+            f"{self.base_url}/flush_cache",
+            params={"timeout": 30},
+            timeout=60,
+        )
+        flush_resp.raise_for_status()
+
+        logger.info("Request 3 (device empty -> should load KV back from MemCache)...")
+        meta3, details3 = self._generate(PROMPT_LONG)
+        host_tokens = int(details3.get("host", 0))
+        logger.info(
+            "req3 cached_tokens=%s cached_tokens_details=%s",
+            meta3.get("cached_tokens"),
+            details3,
+        )
+        self.assertGreater(
+            host_tokens, 0, "linker did not load any KV back from MemCache"
+        )
 
 
 if __name__ == "__main__":
