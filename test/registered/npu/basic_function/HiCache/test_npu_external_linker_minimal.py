@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unittest
 
 import requests
 
@@ -158,7 +159,9 @@ class _MemcacheServices:
             self._owned_config_path = None
 
 
-@register_npu_ci(est_time=900, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=900, suite="base-b-test-1-npu-a3")
+
+
 class TestNpuExternalLinkerMinimal(CustomTestCase):
     @classmethod
     def setUpClass(cls):
