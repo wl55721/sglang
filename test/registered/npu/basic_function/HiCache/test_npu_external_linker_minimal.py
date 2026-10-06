@@ -77,6 +77,10 @@ DEEPSEEK_V4_FLASH_W8A8_ENVS = {
     # compute stream during prefill offload (cold prefill works without the linker,
     # hangs with it). Turn off layer-wise overlap, a known mitigation for this.
     "SGLANG_NPU_MEMCACHE_LINKER_LAYERWISE": "0",
+    # Route offload/load through the host instead of device_sdma: the device-side
+    # DMA transfer competes with the compute stream and wedges the NPU during the
+    # first KV put (timeout). host_shm keeps the transfer off the device DMA path.
+    "SGLANG_NPU_MEMCACHE_LINKER_PROTOCOL": "host_shm",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
