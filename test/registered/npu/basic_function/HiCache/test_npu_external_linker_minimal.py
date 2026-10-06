@@ -73,6 +73,10 @@ DEEPSEEK_V4_FLASH_W8A8_ENVS = {
     # ServerStatus.UnHealthy with a persistent 503; bypassing it makes health return
     # 200 so the driver can issue its own /generate requests.
     "SGLANG_DIAG_BYPASS_HEALTH_GENERATE": "1",
+    # Avoid device-stream wedge when the direct linker does DMA collide with the
+    # compute stream during prefill offload (cold prefill works without the linker,
+    # hangs with it). Turn off layer-wise overlap, a known mitigation for this.
+    "SGLANG_NPU_MEMCACHE_LINKER_LAYERWISE": "0",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
