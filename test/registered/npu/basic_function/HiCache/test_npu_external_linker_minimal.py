@@ -48,9 +48,9 @@ logger = logging.getLogger(__name__)
 DSV4_FLASH_LAUNCH_TIMEOUT = 1800
 META_SERVICE_SETUP_TIMEOUT = 300
 
-# The radix tree only caches page-aligned prefixes (`page_size` = 256, configured
+# The radix tree only caches page-aligned prefixes (`page_size` = 128, configured
 # below). A prompt shorter than one page is truncated to 0 tokens by
-# `RadixKey.page_aligned(256)`, so nothing is ever inserted, offloaded, or loaded
+# `RadixKey.page_aligned(128)`, so nothing is ever inserted, offloaded, or loaded
 # back. This prompt is several pages of English prose so the device KV for a whole
 # page (several pages, really) is cached and offloaded. The exact token count is
 # model-tokenizer dependent; this is comfortably above 2 pages for every common
@@ -408,15 +408,17 @@ class TestNpuExternalLinkerMinimal(CustomTestCase):
                 "--deepep-mode",
                 "auto",
                 "--page-size",
-                "256",
+                "128",
                 "--chunked-prefill-size",
-                "2048",
+                "131072",
+                "--max-prefill-tokens",
+                "80000",
                 "--max-total-tokens",
                 "4096",
                 "--max-running-requests",
                 str(tp_size),
                 "--mem-fraction-static",
-                "0.62",
+                "0.68",
                 "--enable-cache-report",
                 # Skip the server warmup run: under DP=16 the warmup generation
                 # request stalls (unstable HCCL/comm ports), so server_status stays
