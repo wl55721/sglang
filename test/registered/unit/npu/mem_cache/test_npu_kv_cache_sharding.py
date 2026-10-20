@@ -6,8 +6,8 @@ without launching a server:
 1. ``NPUPageInterleaveMHATokenToKVPool`` and
    ``NPUPageInterleaveMLATokenToKVPool`` resolve the diamond inheritance so
    the shard mechanics (``PageInterleaveKVPoolMixin``) win over the NPU base;
-2. their ``_create_gather_comm`` swap the CUDA ``PyNcclCommunicator`` for the
-   HCCL ``NpuCommunicator`` exposed by the shard group;
+2. their ``_create_gather_comm`` swap the CUDA ``PyNcclCommunicator`` for a
+   dedicated HCCL ``NpuKVGatherCommunicator``;
 3. the MLA subclass overrides the fused-``kv_buffer`` accessors into the NPU
    split ``k_buffer``/``v_buffer`` layout instead of inheriting the CUDA
    triton path;
@@ -47,6 +47,9 @@ for _ in (
 
 from sglang.srt.arg_groups import kv_shard_hook
 from sglang.srt.arg_groups.kv_shard_hook import validate_kv_shard_attention_backend
+from sglang.srt.distributed.device_communicators.npu_communicator import (
+    NpuKVGatherCommunicator,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
     NPUMHATokenToKVPool,
@@ -96,11 +99,11 @@ class TestNPUPageInterleaveMHAPoolMRO(unittest.TestCase):
 
 
 class TestNPUPageInterleaveMHAGatherComm(unittest.TestCase):
-    def test_create_gather_comm_returns_npu_communicator(self):
+    def test_create_gather_comm_returns_npu_gather_communicator(self):
         pool = object.__new__(NPUPageInterleaveMHATokenToKVPool)
-        comm = object()
-        shard_group = SimpleNamespace(npu_communicator=comm)
-        self.assertIs(pool._create_gather_comm(shard_group), comm)
+        shard_group = SimpleNamespace(device_group=object())
+        comm = pool._create_gather_comm(shard_group)
+        self.assertIsInstance(comm, NpuKVGatherCommunicator)
 
 
 class TestNPUPageInterleaveMLAPoolMRO(unittest.TestCase):
@@ -154,11 +157,11 @@ class TestNPUPageInterleaveMLAPoolMRO(unittest.TestCase):
 
 
 class TestNPUPageInterleaveMLAGatherComm(unittest.TestCase):
-    def test_create_gather_comm_returns_npu_communicator(self):
+    def test_create_gather_comm_returns_npu_gather_communicator(self):
         pool = object.__new__(NPUPageInterleaveMLATokenToKVPool)
-        comm = object()
-        shard_group = SimpleNamespace(npu_communicator=comm)
-        self.assertIs(pool._create_gather_comm(shard_group), comm)
+        shard_group = SimpleNamespace(device_group=object())
+        comm = pool._create_gather_comm(shard_group)
+        self.assertIsInstance(comm, NpuKVGatherCommunicator)
 
 
 class TestNPUPageInterleaveMLAPrefixRead(unittest.TestCase):

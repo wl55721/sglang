@@ -3,6 +3,9 @@ from typing import TYPE_CHECKING, Optional, Sequence
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.distributed.device_communicators.npu_communicator import (
+    NpuKVGatherCommunicator,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.memory_pool import (
@@ -479,12 +482,12 @@ class NPUPageInterleaveMHATokenToKVPool(
     """MHA/GQA logical-page sharded pool using the NPU (HCCL) gather path.
 
     The CUDA base's layer-ahead prefix gather is built on ``PyNcclCommunicator``;
-    on NPU we swap in the ``GroupCoordinator``'s ``NpuCommunicator`` so the
-    collective runs over HCCL on the shard group.
+    on NPU we swap in a dedicated ``NpuKVGatherCommunicator`` so the collective
+    runs over HCCL on the shard group.
     """
 
     def _create_gather_comm(self, shard_group):
-        return shard_group.npu_communicator
+        return NpuKVGatherCommunicator(group=shard_group.device_group)
 
     def _gather_pairs(self, local_layer: int):
         # The CUDA base indexes token rows directly off token-major
@@ -1204,7 +1207,7 @@ class NPUPageInterleaveMLATokenToKVPool(
     """
 
     def _create_gather_comm(self, shard_group):
-        return shard_group.npu_communicator
+        return NpuKVGatherCommunicator(group=shard_group.device_group)
 
     def _scratch_tensor_specs(self, rows: int):
         return {

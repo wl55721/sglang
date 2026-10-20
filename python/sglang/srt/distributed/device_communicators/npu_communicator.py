@@ -22,7 +22,6 @@ class NpuCommunicator:
         self.disabled = False
         self.group = group
         self.world_size = dist.get_world_size(self.group)
-        self.rank_in_group = dist.get_rank(self.group)
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(x, group=self.group)
@@ -55,6 +54,43 @@ class NpuCommunicator:
 
         return output_tensor.sum(dim=0)
 
+    def all_gather(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        world_size = self.world_size
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += x.dim()
+        input_size = x.size()
+        output_size = (input_size[0] * world_size,) + input_size[1:]
+        # Allocate output tensor.
+        output_tensor = torch.empty(output_size, dtype=x.dtype, device=x.device)
+        # All-gather.
+        all_gather_single(output_tensor, x, group=self.group)
+        # Reshape
+        output_tensor = output_tensor.reshape((world_size,) + input_size)
+        output_tensor = output_tensor.movedim(0, dim)
+        output_tensor = output_tensor.reshape(
+            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+        )
+        return output_tensor
+
+
+class NpuKVGatherCommunicator:
+    """Dedicated HCCL gather communicator for logical-page KV sharding.
+
+    Mirrors ``PyNcclCommunicator``'s out-of-place ``all_gather`` API used by
+    ``PageInterleaveKVPoolMixin``, but over an NPU ``ProcessGroup``. It is kept
+    separate from ``NpuCommunicator`` (which serves ``GroupCoordinator`` with the
+    ``all_gather(x, dim)`` convention) because the two call sites need different
+    signatures under the same method name.
+    """
+
+    def __init__(self, group: ProcessGroup):
+        if not _is_npu:
+            self.disabled = True
+            return
+        self.disabled = False
+        self.group = group
+
     def all_gather(
         self,
         output_tensor: torch.Tensor,
@@ -70,8 +106,9 @@ class NpuCommunicator:
             return
         if sizes is not None:
             raise NotImplementedError(
-                "variable-size all_gather is not supported by NpuCommunicator "
-                "(logical-page KV sharding only uses the uniform-size path)"
+                "variable-size all_gather is not supported by "
+                "NpuKVGatherCommunicator (logical-page KV sharding only uses "
+                "the uniform-size path)"
             )
         all_gather_single(output_tensor, input_tensor, group=self.group)
 

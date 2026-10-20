@@ -205,6 +205,8 @@ class TestKVCacheShardingGQA(KVCacheShardingPDBase):
         "--enable-prefill-cp",
         "--attn-cp-size",
         "2",
+        "--cp-strategy",
+        "zigzag",
     ]
 
 
