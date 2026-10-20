@@ -37,8 +37,8 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
     get_dcp_lens,
 )
+from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -271,7 +271,7 @@ class AscendAttnMaskBuilder:
 
 
 def _cp_allgather_and_save_kv_npu(
-    forward_batch, layer, k, v, cp_size, token_to_kv_pool, swa_loc=None
+    forward_batch, layer, k, v, token_to_kv_pool, swa_loc=None
 ):
     """NPU-compatible CP KV all-gather with merged K/V communication.
 
@@ -281,8 +281,10 @@ def _cp_allgather_and_save_kv_npu(
     k shape: [S_local, tp_k_head_num, qk_head_dim]
     v shape: [S_local, tp_v_head_num, v_head_dim]
 
-    Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
-    a single all-gather for both K and V.
+    Replaces the deprecated CP V1 ``cp_allgather_and_save_kv_cache``: the
+    all-gather + rerange is delegated to the CP V2 strategy via
+    ``cp_gather_full_sequence_states`` (same zigzag/interleave full-order
+    result as the old shim, platform-agnostic on the HCCL group).
 
     swa_loc is the pre-translated full->SWA write target for hybrid SWA pools
     (None for non-SWA pools); set_kv_buffer never translates internally.
@@ -303,8 +305,8 @@ def _cp_allgather_and_save_kv_npu(
     k_feat_size = k_flat.shape[-1]
     kv_flat = torch.cat([k_flat, v_flat], dim=-1)  # [S_local, k_feat + v_feat]
 
-    kv_full = cp_all_gather_rerange_kv_cache(
-        kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
+    kv_full = cp_gather_full_sequence_states(
+        kv_flat, forward_batch, get_current_device_stream_fast()
     )  # [S_full, k_feat + v_feat]
 
     key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
@@ -1620,7 +1622,6 @@ class AscendAttnBackend(AttentionBackend):
                         layer,
                         k,
                         v,
-                        self.attn_cp_size,
                         self.token_to_kv_pool,
                         swa_loc=self.forward_metadata.swa_out_cache_loc,
                     )

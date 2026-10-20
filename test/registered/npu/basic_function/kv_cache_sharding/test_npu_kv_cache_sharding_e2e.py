@@ -55,10 +55,23 @@ _NPU_ALLOC_CONF = "expandable_segments:True,pin_memory_expandable_segments:True"
 # matches the existing NPU PD test node's local metadata store.
 _ASCEND_MF_STORE_URL = "tcp://127.0.0.1:24667"
 
+# Must exceed ``--page-size 64``: the prefix cache matches at page granularity,
+# so a sub-page prompt would floor to 0 tokens and never produce a cache hit.
 _PREFIX_PROMPT = (
     "The theory of relativity, developed by Albert Einstein in the early "
-    "twentieth century, describes how space and time are woven together and "
-    "how gravity arises from the curvature of spacetime."
+    "twentieth century, fundamentally changed how physicists understand space, "
+    "time, gravity, and the structure of the universe itself. Before Einstein, "
+    "physicists believed that space and time were separate and absolute, "
+    "providing a fixed stage on which the events of the universe played out. "
+    "Einstein showed that space and time are in fact woven together into a "
+    "single four-dimensional fabric known as spacetime, and that this fabric "
+    "can be bent and curved by the presence of mass and energy. According to "
+    "general relativity, what we experience as the force of gravity is actually "
+    "the curvature of spacetime caused by massive objects such as stars, "
+    "planets, and galaxies. This insight not only explained the motion of "
+    "planets more accurately than Newton's laws, but also predicted remarkable "
+    "new phenomena including black holes, gravitational waves, and the bending "
+    "of light around the sun."
 )
 
 
@@ -198,9 +211,14 @@ class KVCacheShardingPDBase(PDDisaggregationServerBase):
 
 
 class TestKVCacheShardingGQA(KVCacheShardingPDBase):
-    """GQA/MHA shards across prefill attention-CP ranks."""
+    """GQA/MHA shards across prefill attention-CP ranks.
+
+    The NPU GQA prefill-CP attention path only implements the FIA kernel
+    (``do_cp_attn_fia``); the non-FIA branch raises ``NotImplementedError``.
+    """
 
     model = QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH
+    prefill_only_env = {"ASCEND_USE_FIA": "1"}
     prefill_parallel_args = [
         "--enable-prefill-cp",
         "--attn-cp-size",
