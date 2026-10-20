@@ -13,6 +13,10 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
+from sglang.srt.mem_cache.page_interleave_pool import (
+    PageInterleaveMHATokenToKVPool,
+    PageInterleaveMLATokenToKVPool,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
@@ -469,6 +473,29 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         torch.npu.synchronize()
 
 
+class NPUPageInterleaveMHATokenToKVPool(
+    PageInterleaveMHATokenToKVPool, NPUMHATokenToKVPool
+):
+    """MHA/GQA logical-page sharded pool using the NPU (HCCL) gather path.
+
+    The CUDA base's layer-ahead prefix gather is built on ``PyNcclCommunicator``;
+    on NPU we swap in the ``GroupCoordinator``'s ``NpuCommunicator`` so the
+    collective runs over HCCL on the shard group.
+    """
+
+    def _create_gather_comm(self, shard_group):
+        return shard_group.npu_communicator
+
+    def _gather_pairs(self, local_layer: int):
+        # The CUDA base indexes token rows directly off token-major
+        # ``k_buffer``/``v_buffer``. NPU allocates page-major 5D buffers
+        # (``[pages + 1, page_size, head, dim]``), so flatten each layer to
+        # token-major before the layer-ahead gather selects send rows.
+        k = self.k_buffer[local_layer].view(-1, self.head_num, self.head_dim)
+        v = self.v_buffer[local_layer].view(-1, self.head_num, self.v_head_dim)
+        return [(k, "k"), (v, "v")]
+
+
 class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
     """NPU paged K-only cache used by MiniMax sparse index-only layers."""
 
@@ -643,6 +670,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self.use_dsa = index_head_dim is not None
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
         )
@@ -1158,3 +1186,132 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     assert cpu.shape[0] == len(target_indices)
                     buffer[target_indices] = cpu.to(buffer.device, non_blocking=True)
         torch.npu.synchronize()
+
+
+class NPUPageInterleaveMLATokenToKVPool(
+    PageInterleaveMLATokenToKVPool, NPUMLATokenToKVPool
+):
+    """MLA latent pool striped across its shard group on the NPU (HCCL) path.
+
+    NPU stores the MLA latent and RoPE parts in separate page-major buffers
+    (``k_buffer`` width ``kv_lora_rank``, ``v_buffer`` width
+    ``qk_rope_head_dim``) rather than the CUDA fused ``kv_buffer``. The sharded
+    path therefore stages and gathers two scratch tensors ("k" and "v") instead
+    of the single fused "kv" slot, and runs the layer-ahead gather over HCCL
+    like the MHA pool. The NPU ``ascend`` attention backend reads through
+    ``get_kv_buffer`` and writes through ``set_kv_buffer`` (never the fused
+    triton ``set_mla_kv_buffer`` path of the CUDA base).
+    """
+
+    def _create_gather_comm(self, shard_group):
+        return shard_group.npu_communicator
+
+    def _scratch_tensor_specs(self, rows: int):
+        return {
+            "k": torch.zeros(
+                (rows, 1, self.kv_cache_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            ),
+            "v": torch.zeros(
+                (rows, 1, self.kr_cache_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            ),
+        }
+
+    def _gather_pairs(self, local_layer: int):
+        # NPU keeps latent (nope) and RoPE in separate page-major buffers;
+        # flatten each layer to token-major for the token-row gather.
+        k = self.k_buffer[local_layer].view(-1, 1, self.kv_cache_dim)
+        v = self.v_buffer[local_layer].view(-1, 1, self.kr_cache_dim)
+        return [(k, "k"), (v, "v")]
+
+    def get_kv_buffer(self, layer_id: int):
+        if self._shard_extend_active:
+            slot = self._acquire_slot_for_read(layer_id)
+            k = slot.tensors["k"]
+            v = slot.tensors["v"]
+            if self.store_dtype != self.dtype:
+                k = k.view(self.dtype)
+                v = v.view(self.dtype)
+            return (
+                self._reshape_scratch_to_pages(k),
+                self._reshape_scratch_to_pages(v),
+            )
+        return NPUMLATokenToKVPool.get_kv_buffer(self, layer_id)
+
+    def get_key_buffer(self, layer_id: int):
+        if self._shard_extend_active:
+            slot = self._acquire_slot_for_read(layer_id)
+            k = slot.tensors["k"]
+            if self.store_dtype != self.dtype:
+                k = k.view(self.dtype)
+            return self._reshape_scratch_to_pages(k)
+        return NPUMLATokenToKVPool.get_key_buffer(self, layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        if self._shard_extend_active:
+            slot = self._acquire_slot_for_read(layer_id)
+            v = slot.tensors["v"]
+            if self.store_dtype != self.dtype:
+                v = v.view(self.dtype)
+            return self._reshape_scratch_to_pages(v)
+        return NPUMLATokenToKVPool.get_value_buffer(self, layer_id)
+
+    def _reshape_scratch_to_pages(self, scratch: torch.Tensor) -> torch.Tensor:
+        # The NPU MLA readers index the KV cache *by page* (``npu_*`` kernels use
+        # ``layout_kv="PA_BSND"`` and ``gather_mla_cache_pages`` index_selects dim
+        # 0 by page id). The scratch slot is token-major but page-aligned (page
+        # p's tokens occupy rows p*page_size .. (p+1)*page_size-1), so reshape
+        # each [rows, 1, dim] slot into [rows // page_size, page_size, 1, dim].
+        return scratch.view(-1, self.page_size, 1, scratch.shape[-1])
+
+    def get_kv_buffer_shape(self):
+        # Shape probes must not route through the sharded getters, which may
+        # run before this batch's metadata build while the previous batch's
+        # shard-extend flag is still set. NPU keeps latent and RoPE split, so
+        # probe the backing buffers directly instead of the fused ``kv_buffer``.
+        return self.k_buffer[0].shape, self.v_buffer[0].shape
+
+    def set_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ):
+        loc, _, _ = unwrap_write_loc(loc_info)
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        if cache_v is None:
+            cache_k, cache_v = cache_k.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+        if self._shard_extend_active:
+            # Stage the full chunk into this layer's slot (compute stream):
+            # the NPU readers cover the current chunk through the translated
+            # page table too.
+            slot = self._slots[layer_id % 2]
+            rows = self._translate_loc_cached(loc)
+            staged_k, staged_v = cache_k, cache_v
+            if staged_k.dtype != self.dtype:
+                staged_k = staged_k.to(self.dtype)
+                staged_v = staged_v.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                staged_k = staged_k.view(self.store_dtype)
+                staged_v = staged_v.view(self.store_dtype)
+            slot.tensors["k"][rows] = staged_k
+            slot.tensors["v"][rows] = staged_v
+        owned_idx, local_rows = self._get_write_plan(loc)
+        if owned_idx.numel() == 0:
+            return
+        NPUMLATokenToKVPool.set_kv_buffer(
+            self,
+            layer,
+            local_rows,
+            cache_k.index_select(0, owned_idx),
+            cache_v.index_select(0, owned_idx),
+        )

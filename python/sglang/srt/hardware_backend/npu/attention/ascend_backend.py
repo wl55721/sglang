@@ -29,6 +29,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
     get_dcp_lens,
@@ -356,6 +360,11 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Logical-page KV sharding: present when the pool is a
+        # PageInterleave* pool (--enable-kv-cache-sharding). The extend read
+        # path serves attention from the assembled scratch via a translated
+        # page table (see init_forward_metadata).
+        self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
@@ -556,6 +565,25 @@ class AscendAttnBackend(AttentionBackend):
             ][:, :: self.page_size]
             // self.page_size
         )
+        # Logical-page KV sharding: capture the batch's gather plan and
+        # re-point the logical page table at the assembled scratch pages. In a
+        # sharded extend attention reads [prefix | chunk] from the scratch (the
+        # pool's get_key_buffer/get_value_buffer return it), never the striped
+        # pool rows, so the block table must be translated the same way FA3
+        # does: translate_loc_to_scratch over token locs, then back to page
+        # indices. prepare_kv_shard_forward returns False (and ends the shard
+        # extend) on decode/idle, which reads the striped pool directly.
+        if self._kv_shard_pool is not None and prepare_kv_shard_forward(
+            self._kv_shard_pool,
+            self.req_to_token,
+            forward_batch,
+        ):
+            self.forward_metadata.block_tables = (
+                self._kv_shard_pool.translate_loc_to_scratch(
+                    self.forward_metadata.block_tables * self.page_size
+                )
+                // self.page_size
+            )
         if self.is_hybrid_swa:
             self.forward_metadata.block_tables_swa = (
                 (
@@ -695,6 +723,21 @@ class AscendAttnBackend(AttentionBackend):
                         self.forward_metadata.flatten_prefix_block_tables,
                         torch.flatten(req_prefix_block_tables),
                     )
+                )
+            # Logical-page KV sharding: the MLA prefix cache read indexes the
+            # page-major cache by absolute page id, so re-point these logical
+            # page ids at the assembled scratch pages (same translate as the
+            # block_tables path above, over token locs and back to pages).
+            if (
+                self._kv_shard_pool is not None
+                and self._kv_shard_pool._shard_extend_active
+            ):
+                self.forward_metadata.flatten_prefix_block_tables = (
+                    self._kv_shard_pool.translate_loc_to_scratch(
+                        self.forward_metadata.flatten_prefix_block_tables
+                        * self.page_size
+                    )
+                    // self.page_size
                 )
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:

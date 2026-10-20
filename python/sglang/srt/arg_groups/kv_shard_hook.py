@@ -26,13 +26,13 @@ logger = logging.getLogger(__name__)
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
-    if prefill_backend == "fa3":
+    if prefill_backend in ("fa3", "ascend"):
         return
     if prefill_backend != "trtllm_mla":
         raise ValueError(
             "--enable-kv-cache-sharding currently requires the fa3 prefill "
-            "attention backend, or trtllm_mla for plain-TP MLA; "
-            f"got {prefill_backend!r}."
+            "attention backend (ascend on NPU), or trtllm_mla for plain-TP "
+            f"MLA; got {prefill_backend!r}."
         )
     if not use_mla_backend(server_args):
         raise ValueError("KV sharding with trtllm_mla requires an MLA model.")
@@ -168,12 +168,13 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     validate_kv_shard_attention_backend(server_args, cfg)
-    if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+    if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "ascend"):
         raise ValueError(
-            "--enable-kv-cache-sharding currently only supports the mooncake "
-            "and nixl transfer backends: both route sends through "
-            "CommonKVSender._prepare_send_indices and pair destinations by "
-            "fancy index. Got --disaggregation-transfer-backend "
+            "--enable-kv-cache-sharding currently only supports the mooncake, "
+            "nixl, and ascend transfer backends: each routes sends through "
+            "CommonKVSender._prepare_send_indices and pairs destinations by "
+            "fancy index (ascend inherits the mooncake sender). Got "
+            "--disaggregation-transfer-backend "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
     if envs.SGLANG_DISAGG_STAGING_BUFFER.get():

@@ -399,10 +399,6 @@ class KVCacheConfigurator:
         self.kv_shard_group = None
         if self.kv_shard_spec is None:
             return
-        reject_out_of_tree_path(
-            current_platform,
-            subsystem="logical-page KV sharding (--enable-kv-cache-sharding)",
-        )
 
         self.kv_shard_rank = self.kv_shard_spec.shard_rank
         self.kv_shard_size = self.kv_shard_spec.shard_size
@@ -2078,7 +2074,21 @@ class KVCacheConfigurator:
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
-        token_to_kv_pool = NPUMLATokenToKVPool(
+        pool_cls = NPUMLATokenToKVPool
+        pool_kwargs = {}
+        if self.kv_shard_rank is not None:
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUPageInterleaveMLATokenToKVPool,
+            )
+
+            assert not is_dsa_model, (
+                "--enable-kv-cache-sharding does not support DSA models"
+            )
+            pool_cls = NPUPageInterleaveMLATokenToKVPool
+            pool_kwargs["shard_spec"] = self.kv_shard_spec
+            pool_kwargs["shard_group"] = self.kv_shard_group
+
+        token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
@@ -2101,6 +2111,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            **pool_kwargs,
         )
         return token_to_kv_pool
 
@@ -2109,7 +2120,18 @@ class KVCacheConfigurator:
             NPUMHATokenToKVPool,
         )
 
-        token_to_kv_pool = NPUMHATokenToKVPool(
+        pool_cls = NPUMHATokenToKVPool
+        pool_kwargs = {}
+        if self.kv_shard_rank is not None:
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUPageInterleaveMHATokenToKVPool,
+            )
+
+            pool_cls = NPUPageInterleaveMHATokenToKVPool
+            pool_kwargs["shard_spec"] = self.kv_shard_spec
+            pool_kwargs["shard_group"] = self.kv_shard_group
+
+        token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
@@ -2122,6 +2144,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            **pool_kwargs,
         )
         return token_to_kv_pool
 
@@ -2553,15 +2576,27 @@ class KVCacheConfigurator:
             # layouts. Specialized quantization methods need packed-data and
             # scale-aware sharded writes/gathers; ordinary CUDA FP8 uses the
             # plain pool and has no specialized quant_method.
-            assert pool_cls is MHATokenToKVPool, (
-                "--enable-kv-cache-sharding is incompatible with "
-                f"the {pool_cls.__name__} pool"
-            )
             assert quant_method is None, (
                 "--enable-kv-cache-sharding does not support specialized KV-cache "
                 "quantization methods (e.g. FP4); ordinary CUDA FP8 is supported."
             )
-            pool_cls = PageInterleaveMHATokenToKVPool
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUPageInterleaveMHATokenToKVPool,
+                    NPUMHATokenToKVPool,
+                )
+
+                assert pool_cls is NPUMHATokenToKVPool, (
+                    "--enable-kv-cache-sharding is incompatible with "
+                    f"the {pool_cls.__name__} pool on NPU"
+                )
+                pool_cls = NPUPageInterleaveMHATokenToKVPool
+            else:
+                assert pool_cls is MHATokenToKVPool, (
+                    "--enable-kv-cache-sharding is incompatible with "
+                    f"the {pool_cls.__name__} pool"
+                )
+                pool_cls = PageInterleaveMHATokenToKVPool
             pool_kwargs["shard_spec"] = self.kv_shard_spec
             pool_kwargs["shard_group"] = self.kv_shard_group
         token_to_kv_pool = pool_cls(
