@@ -59,6 +59,26 @@ def _parse_metric(logs: str, pattern: re.Pattern):
     return float(m.group(1)) if m else None
 
 
+def _ping_daemon(device_uuid: str) -> bool:
+    """Confirm the daemon's serve socket answers a ping, not just that the
+    .ready file exists. The ready file can briefly outlive a daemon that
+    started serving and then died."""
+    from sglang.srt.weight_cache.protocol import recv_msg, send_msg
+
+    sock_path = get_socket_path(device_uuid)
+    if not os.path.exists(sock_path):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect(sock_path)
+            send_msg(s, {"type": "ping"})
+            resp = recv_msg(s)
+            return resp.get("status") == "ok"
+    except Exception:
+        return False
+
+
 class TestNpuWeightCacheStartup(CustomTestCase):
     """Benchmark the weight-loading stage three ways and assert the weight cache
     (warm zero-copy IPC import) is faster than a cold disk load.
@@ -133,6 +153,23 @@ class TestNpuWeightCacheStartup(CustomTestCase):
                 time.sleep(2)
         cls.daemon_logs = _read_logs([DAEMON_STDERR])
         cls.daemon_time = _parse_metric(cls.daemon_logs, DAEMON_DISK_RE)
+
+        # The .ready file can linger after a daemon that finished serving and
+        # then died. Confirm the daemon is actually alive and reachable before
+        # launching the client, so a dead daemon surfaces its log here instead
+        # of as a confusing client_time=None (client silently fell back to disk).
+        if cls.daemon_process.poll() is not None:
+            raise RuntimeError(
+                f"Weight cache daemon exited with code {cls.daemon_process.returncode} "
+                f"before the client launched. Daemon log:\n{cls.daemon_logs}"
+            )
+        for device_uuid in cls.npu_uuids:
+            if not _ping_daemon(device_uuid):
+                daemon_log = _read_logs([DAEMON_STDERR])
+                raise RuntimeError(
+                    f"Weight cache daemon for NPU {device_uuid} did not answer a "
+                    f"ping after ready. Daemon log:\n{daemon_log}"
+                )
 
         # Step 3: client — warm import over zero-copy IPC (weight cache ON).
         cls.client_stdout = open(CLIENT_STDOUT, "w")
