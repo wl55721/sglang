@@ -29,16 +29,17 @@ register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 # load path actually ran (and did not silently fall back to disk).
 STDOUT_FILENAME = "/tmp/test_npu_weight_cache_stdout.log"
 STDERR_FILENAME = "/tmp/test_npu_weight_cache_stderr.log"
-# Capture the daemon's own logs too so test_daemon_served_via_npu_ipc can assert
+# Capture the daemon's own logs too so test_daemon_served_via_torch_ipc can assert
 # the daemon genuinely served a fetch_state request over the NPU transport
 # (proving a real client<->daemon handshake, not the client merely loading over
 # IPC in isolation).
 DAEMON_STDERR_FILENAME = "/tmp/test_npu_weight_cache_daemon_stderr.log"
 
 # Daemon-side log marker emitted only when it serves a fetch_state request via
-# the NPU transport backend. Absence means the daemon never handed out handles
-# to this client, so the "IPC load" on the client side would be suspect.
-DAEMON_SERVED_MARKER = "via npu_ipc transport"
+# the torch_ipc transport backend (which NPU reuses). Absence means the daemon
+# never handed out handles to this client, so the "IPC load" on the client side
+# would be suspect.
+DAEMON_SERVED_MARKER = "via torch_ipc transport"
 
 PROMPTS = [
     "The capital of France is",
@@ -56,9 +57,10 @@ class TestNpuWeightCacheDaemon(CustomTestCase):
     """E2E test: start a weight cache daemon, then launch a server in client
     mode (TP=1) and confirm it loads weights via zero-copy IPC and generates.
 
-    This exercises the NPU `NpuIpcTransportBackend` path: the daemon loads the
-    model to Ascend HBM and exports native torch_npu reduction handles; the
-    client server maps them over IPC instead of reading the disk again.
+    This exercises the NPU zero-copy IPC path via `TorchIpcTransportBackend`:
+    the daemon loads the model to Ascend HBM and exports native torch_npu
+    reduction handles; the client server maps them over IPC instead of reading
+    the disk again.
     """
 
     @classmethod
@@ -76,7 +78,7 @@ class TestNpuWeightCacheDaemon(CustomTestCase):
 
         # Step 1: Launch the weight cache daemon (blocks until one rank is ready,
         # then serves the exported handles over the weight-cache socket). Capture
-        # its stderr so test_daemon_served_via_npu_ipc can assert the daemon
+        # its stderr so test_daemon_served_via_torch_ipc can assert the daemon
         # actually served handles to the client.
         cls.daemon_stderr = open(DAEMON_STDERR_FILENAME, "w")
         cls.daemon_process = subprocess.Popen(
@@ -208,14 +210,14 @@ class TestNpuWeightCacheDaemon(CustomTestCase):
             "load log line was not found — the loader likely fell back to disk.",
         )
 
-    def test_daemon_served_via_npu_ipc(self):
+    def test_daemon_served_via_torch_ipc(self):
         """Assert the daemon itself served a fetch_state over the NPU transport.
 
         ``test_loaded_via_ipc`` proves the *client* took the IPC load path, but
         alone it can't rule out the client loading over IPC while a stale/absent
         daemon never participated. This closes the loop on the other end: the
         daemon only emits the marker when it serves tensors via
-        ``NpuIpcTransportBackend`` (name ``npu_ipc``), so its presence proves a
+        ``TorchIpcTransportBackend`` (name ``torch_ipc``), so its presence proves a
         real client<->daemon handshake over the NPU transport happened.
         """
         if getattr(self, "daemon_stderr", None) is not None:
