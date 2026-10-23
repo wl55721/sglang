@@ -1383,6 +1383,16 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
+        # Pad back to the CP physical rank length, mirroring the zigzag
+        # strategy's run_attention: the sharded q is padded past its logical
+        # rows (shard_hidden_states / pad_local_rows), the residual stream
+        # carries that padded length, so the attention output must match it or
+        # the FFN boundary sees a shape mismatch between the output and residual.
+        pad_size = q.shape[0] - attn_out.shape[0]
+        if pad_size > 0:
+            attn_out = torch.cat(
+                [attn_out, attn_out.new_zeros(pad_size, *attn_out.shape[1:])], dim=0
+            )
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_sparse(
