@@ -498,6 +498,26 @@ class NPUPageInterleaveMHATokenToKVPool(
         v = self.v_buffer[local_layer].view(-1, self.head_num, self.v_head_dim)
         return [(k, "k"), (v, "v")]
 
+    def _store_kv_layer(self, layer_idx, loc, cache_k, cache_v):
+        # NPU stores buffers as 4-D TND (tokens, 1, head, dim); the CUDA
+        # sharded write path (PageInterleaveMHATokenToKVPool.set_kv_buffer)
+        # hands _store_kv_layer 3-D cache_k/cache_v plus token rows, so the
+        # base-class `k_cache[indices] = k` would broadcast [n, head, dim]
+        # into a [n, 1, head, dim] slice and fail. Scatter through an
+        # equivalent 3-D view instead (same as NPUMHATokenToKVPool.write).
+        num_rows = loc.numel()
+        loc_indices = loc.contiguous().view(-1, 1)
+        torch_npu.npu_scatter_nd_update_(
+            self.k_buffer[layer_idx].view(-1, self.head_num, self.head_dim),
+            loc_indices,
+            cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
+        )
+        torch_npu.npu_scatter_nd_update_(
+            self.v_buffer[layer_idx].view(-1, self.head_num, self.v_head_dim),
+            loc_indices,
+            cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
+        )
+
 
 class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
     """NPU paged K-only cache used by MiniMax sparse index-only layers."""

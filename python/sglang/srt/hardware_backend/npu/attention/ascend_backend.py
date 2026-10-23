@@ -1325,13 +1325,20 @@ class AscendAttnBackend(AttentionBackend):
         cp_meta = forward_batch.attn_cp_metadata
 
         # Local tokens are laid out [all_seqs_prev, all_seqs_next]; split at
-        # total_q_prev_tokens rather than the midpoint to support bs > 1.
+        # total_q_prev_tokens rather than the midpoint to support bs > 1. The
+        # CP sharded q is padded past its logical rows (see zigzag
+        # shard_hidden_states / pad_local_rows), so truncate q_next to the
+        # logical token count — otherwise TND FIA sees queryT != the trailing
+        # cumsum(actual_seq_q_next_list) and fails tiling.
         split = cp_meta.total_q_prev_tokens
+        logical_tokens = split + cp_meta.total_q_next_tokens
         q_prev = (
             q[:split].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
         )
         q_next = (
-            q[split:].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            q[split:logical_tokens]
+            .contiguous()
+            .reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
         )
 
         k_cache_paged = k_cache.view(
