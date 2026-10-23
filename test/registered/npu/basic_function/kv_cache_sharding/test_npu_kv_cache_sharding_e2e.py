@@ -34,7 +34,7 @@ import requests
 
 from sglang.test.ascend.test_ascend_utils import (
     DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH,
-    QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH,
+    QWEN3_8B_WEIGHTS_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -217,7 +217,7 @@ class TestKVCacheShardingGQA(KVCacheShardingPDBase):
     (``do_cp_attn_fia``); the non-FIA branch raises ``NotImplementedError``.
     """
 
-    model = QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH
+    model = QWEN3_8B_WEIGHTS_PATH
     prefill_only_env = {"ASCEND_USE_FIA": "1"}
     prefill_parallel_args = [
         "--enable-prefill-cp",
