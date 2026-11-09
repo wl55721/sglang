@@ -4,17 +4,15 @@
 用途
 ----
 在 EPD 拓扑（encoder + prefill + decode + LB）上比较全局多模态 embedding 缓存的
-性能收益，量化三组场景：
+性能收益，量化两组场景：
 
 - A baseline：不开缓存，同一批图片反复请求 -> 每次都是 miss（全部重算 ViT）。
 - B 高命中：开缓存（``--enable-mm-global-cache --mm-global-cache-backend mooncake``），
   同一批图片反复请求 -> 初次 miss 之后全部命中。
-- C 零命中：开缓存、全部互异图片 -> 每次 miss，仅隔离出缓存带来的固定开销。
 
 收益口径
 --------
 - A vs B = 净收益，收益公式 ``(miss_TTFT - hit_TTFT) / miss_TTFT``。
-- A vs C = 固定成本（开缓存但从不命中的额外开销）。
 
 指标
 ----
@@ -109,31 +107,6 @@ def _data_url_from_image(image_path: str, mime: str = "image/png") -> str:
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("ascii")
     return f"data:{mime};base64,{b64}"
-
-
-def _synthetic_image_data_urls(n: int, reference_path: str) -> List[str]:
-    """生成 n 张与参考图同分辨率的互异合成图 data URL（用于 C 组零命中）。
-
-    关键：必须与 A/B 组使用同一分辨率（保证相同的动态 tiling / ViT 计算量），
-    仅用不同 seed 的随机噪声保证内容哈希两两不同，从而每次请求都 miss。
-    早期用 64x64 纯色图会因分辨率/复杂度差异导致编码成本不可比，已弃用。
-    """
-    from PIL import Image
-    import random as _random
-
-    with Image.open(reference_path) as ref:
-        size = ref.size  # (宽, 高)
-
-    urls: List[str] = []
-    for i in range(n):
-        rng = _random.Random(i)
-        raw = bytes(rng.getrandbits(8) for _ in range(size[0] * size[1] * 3))
-        img = Image.frombytes("RGB", size, raw)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        urls.append(f"data:image/png;base64,{b64}")
-    return urls
 
 
 def _cycle_urls(pool: List[str], n: int) -> List[str]:
@@ -585,12 +558,7 @@ def run_group(topology: Topology, group: str, args: argparse.Namespace) -> Group
     aclient = topology.make_async_client()
 
     total_requests = args.num_requests + args.warmup
-    if group in ("A", "B"):
-        all_urls = _cycle_urls(args.real_image_urls, total_requests)
-    else:  # C：全部互异，但与 A/B 同分辨率，保证编码成本可比
-        all_urls = _synthetic_image_data_urls(
-            total_requests, args.real_image_paths[0]
-        )
+    all_urls = _cycle_urls(args.real_image_urls, total_requests)
 
     warmup_urls = all_urls[: args.warmup]
     measure_urls = all_urls[args.warmup :]
@@ -685,12 +653,6 @@ def _print_results(results: List[GroupStats]) -> None:
         print(f"  hit_TTFT  = {_ms(b.seq_ttft_p50_s)} ms")
         print(f"  收益 = (miss - hit) / miss = {ttft_gain * 100:.1f}%")
 
-    if "A" in by_group and "C" in by_group:
-        c = by_group["C"]
-        # 固定成本 = C（零命中）相对 A（baseline）的 TTFT 额外开销。
-        overhead = c.seq_ttft_p50_s - by_group["A"].seq_ttft_p50_s
-        print("\n固定成本（A vs C，顺序 TTFT P50）：")
-        print(f"  C 零命中 TTFT - A baseline TTFT = {_ms(overhead)} ms")
     print("=================================================\n")
 
 
@@ -705,8 +667,8 @@ def _parse_args() -> argparse.Namespace:
         "--group",
         type=str,
         default="all",
-        choices=["A", "B", "C", "all"],
-        help="跑哪一组：A=baseline无缓存 / B=高命中 / C=零命中 / all=全部",
+        choices=["A", "B", "all"],
+        help="跑哪一组：A=baseline无缓存 / B=高命中 / all=全部",
     )
     parser.add_argument(
         "--concurrency",
@@ -778,13 +740,13 @@ def main() -> None:
     if device == "cpu":
         raise RuntimeError("未检测到可用计算设备（npu/cuda），无法进行 benchmark")
 
-    groups = ["A", "B", "C"] if args.group == "all" else [args.group]
+    groups = ["A", "B"] if args.group == "all" else [args.group]
     results: List[GroupStats] = []
 
     for group in groups:
         print(f"\n===== 开始 {group} 组 benchmark =====")
-        # A 组不开缓存、不启动 mooncake；B/C 开缓存并启动 mooncake。
-        enable_cache = group in ("B", "C")
+        # A 组不开缓存、不启动 mooncake；B 组开缓存并启动 mooncake。
+        enable_cache = group == "B"
         topology = Topology(args, enable_cache=enable_cache, device=device)
         try:
             topology.start()
