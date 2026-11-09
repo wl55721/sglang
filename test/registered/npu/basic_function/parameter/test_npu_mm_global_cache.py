@@ -3,6 +3,7 @@ import io
 import os
 import re
 import subprocess
+import tempfile
 import time
 import unittest
 from urllib.parse import urlparse
@@ -60,9 +61,12 @@ class TestNpuMmGlobalCache(CustomTestCase):
     def _start_mooncake_services(cls):
         """Start mooncake metadata server + master, then wait for readiness."""
         cls.mooncake_master_port = find_available_port(50051)
+        cls.mooncake_metrics_port = find_available_port(9003)
         cls.mooncake_metadata_port = find_available_port(8080)
 
-        cls.metadata_service_process = subprocess.Popen(
+        cls._mooncake_logs = {}
+        cls.metadata_service_process = cls._launch_mooncake_service(
+            "metadata",
             [
                 "python3",
                 "-m",
@@ -70,17 +74,48 @@ class TestNpuMmGlobalCache(CustomTestCase):
                 "--port",
                 str(cls.mooncake_metadata_port),
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=os.environ.copy(),
+            # mooncake >= 0.3.13 refuses to bind 0.0.0.0 without an auth token
+            # (CVE-2026-103765). This self-contained CI test has no external
+            # metadata exposure and wires workers via MC_METADATA_HTTP_TOKEN-aware
+            # endpoints only, so keep the legacy open behavior.
+            extra_env={"MC_METADATA_HTTP_ALLOW_INSECURE": "1"},
         )
-        cls.master_service_process = subprocess.Popen(
-            ["mooncake_master", "--port", str(cls.mooncake_master_port)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=os.environ.copy(),
+        cls.master_service_process = cls._launch_mooncake_service(
+            "master",
+            [
+                "mooncake_master",
+                "--port",
+                str(cls.mooncake_master_port),
+                "--metrics_port",
+                str(cls.mooncake_metrics_port),
+            ],
         )
         cls._wait_for_mooncake_services_ready()
+
+    @classmethod
+    def _launch_mooncake_service(cls, name, command, extra_env=None):
+        env = os.environ.copy()
+        if extra_env:
+            env.update(extra_env)
+        log = tempfile.NamedTemporaryFile(
+            prefix=f"mooncake-{name}-", suffix=".log", delete=False
+        )
+        cls._mooncake_logs[name] = log.name
+        with log:
+            return subprocess.Popen(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=env,
+            )
+
+    @classmethod
+    def _mooncake_log_tail(cls, name):
+        path = cls._mooncake_logs.get(name)
+        if not path or not os.path.exists(path):
+            return "(no log)"
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-30:])
 
     @classmethod
     def _wait_for_mooncake_services_ready(cls, timeout: int = 30):
@@ -88,19 +123,30 @@ class TestNpuMmGlobalCache(CustomTestCase):
         metadata_url = f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata"
         print(f"Waiting for Mooncake services on {metadata_url} ...")
         while time.time() < deadline:
-            if cls.master_service_process.poll() is not None:
-                raise RuntimeError(
-                    f"mooncake_master exited prematurely: {cls.master_service_process.returncode}"
-                )
+            for name, proc in (
+                ("metadata", cls.metadata_service_process),
+                ("master", cls.master_service_process),
+            ):
+                if proc.poll() is not None:
+                    raise RuntimeError(
+                        f"mooncake_{name} exited prematurely (code={proc.returncode}); "
+                        f"log tail:\n{cls._mooncake_log_tail(name)}"
+                    )
             try:
-                r = requests.get(metadata_url, timeout=2)
-                if r.status_code == 200:
-                    print("Mooncake services are ready")
-                    return
-            except requests.RequestException:
-                pass
+                # GET /metadata returns 400 "metadata key is required" when no
+                # `key` param is supplied; any HTTP response means the metadata
+                # HTTP server is listening, which is exactly what we probe for.
+                requests.get(metadata_url, timeout=2)
+                print("Mooncake services are ready")
+                return
+            except requests.RequestException as e:
+                print(f"Metadata server not reachable yet: {e}")
             time.sleep(2)
-        raise RuntimeError(f"Mooncake services not ready within {timeout}s")
+        raise RuntimeError(
+            f"Mooncake services not ready within {timeout}s; "
+            f"metadata log tail:\n{cls._mooncake_log_tail('metadata')}"
+            f"\nmaster log tail:\n{cls._mooncake_log_tail('master')}"
+        )
 
     @classmethod
     def setUpClass(cls):
