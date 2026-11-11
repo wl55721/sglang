@@ -460,9 +460,12 @@ def _batch_encode_per_image_misses(
 
         max_batch_images = envs.SGLANG_MM_VIT_MAX_BATCH_IMAGES.get()
         if _is_npu and max_batch_images < 0:
-            # NPU default: bound the encoder activation peak. CUDA keeps the
-            # uncapped single mega-batch.
-            max_batch_images = 8
+            # NPU default: bound the encoder activation peak while keeping
+            # most of the cross-request batching gain. 8 was measured
+            # OOM-free but ~1-6ms over the TPOT budget (per-call capture of
+            # new graph shapes compounds the smaller-batch cost); 16 halves
+            # the number of encoder calls. CUDA keeps the uncapped mega-batch.
+            max_batch_images = 16
         group_size = (
             max_batch_images if max_batch_images > 0 else len(miss_items)
         ) or 1
