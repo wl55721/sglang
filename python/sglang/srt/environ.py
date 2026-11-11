@@ -1807,6 +1807,14 @@ class Envs:
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
+    # Cap how many unique cache-miss images share one cross-request ViT call
+    # in the chunked-prefill embedding path. The encoder's activation peak
+    # scales with the batch's image count; when unchunked prefill admits a
+    # huge batch at once (chunked_prefill_size=-1 + delayer batching), one
+    # mega-batch call can exhaust the remaining device memory on NPU. A
+    # positive value splits the misses into groups of at most that many
+    # images per encoder call; negative disables the cap (one mega-batch).
+    SGLANG_MM_VIT_MAX_BATCH_IMAGES = EnvInt(-1)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)

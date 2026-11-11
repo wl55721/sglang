@@ -7,6 +7,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -446,39 +447,63 @@ def _batch_encode_per_image_misses(
                     item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
                 unique_misses[cache_key] = (item, expected_token_count)
 
-    # Phase 1b: single ViT call for all unique cache misses
+    # Phase 1b: encode all unique cache misses, optionally capped per ViT call.
+    # One mega-batch maximizes encoder utilization, but its activation peak
+    # scales with the batch's image count; with unchunked prefill admitting
+    # dozens of concurrent image requests at once, that peak can exhaust the
+    # remaining device memory. SGLANG_MM_VIT_MAX_BATCH_IMAGES splits the
+    # misses into groups of at most that many images per encoder call.
     if unique_misses:
         ordered_cache_keys = list(unique_misses.keys())
         miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
         token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
 
-        _move_items_to_device(miss_items, device, data_embedding_func)
-        all_miss_embedding = data_embedding_func(miss_items)
+        max_batch_images = envs.SGLANG_MM_VIT_MAX_BATCH_IMAGES.get()
+        if _is_npu and max_batch_images < 0:
+            # NPU default: bound the encoder activation peak. CUDA keeps the
+            # uncapped single mega-batch.
+            max_batch_images = 8
+        group_size = (
+            max_batch_images if max_batch_images > 0 else len(miss_items)
+        ) or 1
 
-        if isinstance(all_miss_embedding, list):
-            # Per-item embeddings: no split needed, and each cache entry owns
-            # its storage (a torch.split view would pin the whole concatenated
-            # buffer for as long as any single item stays cached). Mirrors
-            # _get_chunked_embedding_by_item.
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
-            )
-            split_embeddings = [
-                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
-            ]
-        else:
-            all_miss_embedding = all_miss_embedding.reshape(
-                -1, all_miss_embedding.shape[-1]
-            )
-            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
-        for cache_key, emb in zip(ordered_cache_keys, split_embeddings):
-            if embedding_cache.set(cache_key[0], EmbeddingResult(embedding=emb)):
-                cached = embedding_cache.get_single(cache_key[0])
-                if _embedding_token_count(cached.embedding) == cache_key[1]:
-                    emb = cached.embedding
-            # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
-            hash_to_embedding[cache_key] = emb
+        for group_start in range(0, len(miss_items), group_size):
+            group = slice(group_start, group_start + group_size)
+            group_items = miss_items[group]
+            group_keys = ordered_cache_keys[group]
+            group_token_counts = token_counts[group]
+
+            _move_items_to_device(group_items, device, data_embedding_func)
+            all_miss_embedding = data_embedding_func(group_items)
+
+            if isinstance(all_miss_embedding, list):
+                # Per-item embeddings: no split needed, and each cache entry
+                # owns its storage (a torch.split view would pin the whole
+                # concatenated buffer for as long as any single item stays
+                # cached). Mirrors _get_chunked_embedding_by_item.
+                assert len(all_miss_embedding) == len(group_items), (
+                    f"per-item embedding count {len(all_miss_embedding)} != "
+                    f"cache-miss item count {len(group_items)}"
+                )
+                split_embeddings = [
+                    emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+                ]
+            else:
+                all_miss_embedding = all_miss_embedding.reshape(
+                    -1, all_miss_embedding.shape[-1]
+                )
+                split_embeddings = torch.split(
+                    all_miss_embedding, group_token_counts, dim=0
+                )
+            for cache_key, emb in zip(group_keys, split_embeddings):
+                if embedding_cache.set(
+                    cache_key[0], EmbeddingResult(embedding=emb)
+                ):
+                    cached = embedding_cache.get_single(cache_key[0])
+                    if _embedding_token_count(cached.embedding) == cache_key[1]:
+                        emb = cached.embedding
+                # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
+                hash_to_embedding[cache_key] = emb
 
     return hash_to_embedding
 
