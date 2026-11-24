@@ -70,9 +70,11 @@ BASE_ARGS = [
     "--max-prefill-tokens",
     "8192",
     "--trust-remote-code",
-    # The ~8k-token probes must fit: with the checkpoint's default context
-    # window (~8k) the first prefill chunk still streams a token but the
-    # second chunk is admitted as over-length and FINISH_ABORTs.
+    # The effective prompt ceiling on this server is the KV pool, not the
+    # context length: the ingress check clamps to min(context_len,
+    # max_total_num_tokens), and max_total_num_tokens is only ~7k tokens at
+    # mem-fraction 0.8 for this DSA checkpoint. 32768 just keeps the model
+    # side from binding first; the pool is the real limit.
     "--context-length",
     "32768",
     # The minimum stable fraction for this checkpoint: the sizing profile
@@ -107,8 +109,9 @@ LAUNCH_TIMEOUT = 3000
 
 # Deterministic ~5k-token prompts; long enough that indexer scoring dominates
 # prefill (still 2 chunks at --chunked-prefill-size 4096), unique enough that
-# no radix-cache reuse hides the effect, yet short enough to leave decode
-# headroom inside a small KV pool.
+# no radix-cache reuse hides the effect. 2900 words tokenize to ~5.1k tokens
+# on the GLM tokenizer (~1.75 tokens per word), safely under the ~7k-token KV
+# pool ceiling that the ingress length check clamps to on this server.
 _WORDS = [
     "delta",
     "echo",
@@ -129,7 +132,7 @@ _WORDS = [
 ]
 
 
-def build_long_prompt(seed: int, num_words: int = 4500) -> str:
+def build_long_prompt(seed: int, num_words: int = 2900) -> str:
     rng = random.Random(seed)
     body = " ".join(rng.choice(_WORDS) for _ in range(num_words))
     return f"Summarize the following text in one short sentence.\n\n{body}"
