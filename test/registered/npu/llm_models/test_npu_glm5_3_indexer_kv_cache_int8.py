@@ -75,13 +75,13 @@ BASE_ARGS = [
     # second chunk is admitted as over-length and FINISH_ABORTs.
     "--context-length",
     "32768",
-    # Above the minimum viable fraction for this checkpoint (the sizing
-    # profile raises below 0.790 once weights are loaded). The KV pool must
-    # comfortably hold an ~5k-token probe PLUS its decode headroom, or the
-    # scheduler retracts the request at the first decode step and the request
-    # FINISH_ABORTs right after its first token (ttft == total).
+    # The minimum stable fraction for this checkpoint: the sizing profile
+    # raises below 0.790 once weights are loaded, and 0.85 leaves so little
+    # free memory that decode-graph capture segfaults inside the DSA indexer
+    # op (avail_mem ~9 GB). The abort on long probes is fixed by the shorter
+    # probe prompts below, not by a bigger pool.
     "--mem-fraction-static",
-    "0.85",
+    "0.8",
     "--max-running-requests",
     "32",
     "--quantization",
