@@ -10,10 +10,11 @@ agnostic); this file verifies on NPU that:
 1. Functionality: `--schedule-policy uniboost` (+ `--uniboost-gamma`,
    `--enable-uniboost-gamma-ada`) serves every request correctly and the
    running config is visible through /server_info.
-2. Effect: in a mixed burst (one long cold prompt + several cache-hot short
-   requests), the TTFT (Time To First Token, first-token latency) of the
-   cache-hot requests is materially lower than under the FCFS (First Come
-   First Served) baseline.
+2. Effect: in a mixed burst (a blocker request holding the only running
+   slot, then one long cold prompt + several cache-hot short requests
+   queued behind it), the TTFT (Time To First Token, first-token latency)
+   of the cache-hot requests is materially lower than under the FCFS
+   (First Come First Served) baseline.
 
 [Test Category] Interface
 [Test Target] --schedule-policy uniboost / --uniboost-gamma / --enable-uniboost-gamma-ada
@@ -111,8 +112,8 @@ _COLD_WORDS = [
 ]
 
 
-def build_cold_prompt(num_words: int = 9000) -> str:
-    rng = random.Random(20260101)
+def build_cold_prompt(num_words: int = 9000, seed: int = 20260101) -> str:
+    rng = random.Random(seed)
     return " ".join(rng.choice(_COLD_WORDS) for _ in range(num_words))
 
 
@@ -144,21 +145,29 @@ def stream_generate_ttft(base_url: str, payload: dict) -> dict:
 
 
 def run_mixed_burst(base_url: str, cold_prompt: str, num_hot: int = 8, rounds: int = 3):
-    """One round = a long cold request submitted first, then `num_hot`
-    cache-hot short requests submitted right after (all streaming). Under
-    FCFS the hot requests queue behind the cold prompt; under uniboost they
-    are admitted ahead of it (bounded boost). Returns (hot_ttfts, cold_ttfts)."""
+    """One round: a blocker request first occupies the only running slot
+    (--max-running-requests 1), then a long cold prompt and `num_hot`
+    cache-hot short requests are submitted while the blocker is still
+    running, so all of them compete in the WAITING queue -- the only place
+    where the schedule policy applies. UniBoost cannot reorder a request
+    that is already running, and a request arriving into an empty queue is
+    admitted immediately without ever waiting; the blocker guarantees the
+    cold/hot group actually queues. Under FCFS the cold prompt is admitted
+    ahead of the hots (arrival order) and its full prefill delays every
+    hot; under uniboost the boosted cache-hot requests are admitted first
+    and the cold prompt queues last. Returns (hot_ttfts, cold_ttfts)."""
     hot_ttfts, cold_ttfts = [], []
     for round_idx in range(rounds):
-        futures = []
-
-        def _cold():
-            payload = {
-                "text": cold_prompt,
-                "sampling_params": {"max_new_tokens": 8, "temperature": 0},
-                "stream": True,
-            }
-            return stream_generate_ttft(base_url, payload)
+        blocker_payload = {
+            "text": build_cold_prompt(seed=1000 + round_idx),
+            "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+            "stream": True,
+        }
+        cold_payload = {
+            "text": cold_prompt,
+            "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+            "stream": True,
+        }
 
         def _hot(i: int):
             payload = {
@@ -169,9 +178,11 @@ def run_mixed_burst(base_url: str, cold_prompt: str, num_hot: int = 8, rounds: i
             }
             return stream_generate_ttft(base_url, payload)
 
-        with ThreadPoolExecutor(max_workers=num_hot + 1) as pool:
-            futures.append(pool.submit(_cold))
-            time.sleep(0.05)  # cold request reaches the queue first
+        with ThreadPoolExecutor(max_workers=num_hot + 2) as pool:
+            futures = [pool.submit(stream_generate_ttft, base_url, blocker_payload)]
+            time.sleep(0.3)  # the blocker owns the only running slot now
+            futures.append(pool.submit(stream_generate_ttft, base_url, cold_payload))
+            time.sleep(0.05)
             for i in range(num_hot):
                 futures.append(pool.submit(_hot, i))
             results = [f.result() for f in futures]
@@ -181,8 +192,8 @@ def run_mixed_burst(base_url: str, cold_prompt: str, num_hot: int = 8, rounds: i
             assert r["finish_reason"] in ("stop", "length"), (
                 f"unexpected finish_reason: {r['finish_reason']}"
             )
-        cold_ttfts.append(results[0]["ttft"])
-        hot_ttfts.extend(r["ttft"] for r in results[1:])
+        cold_ttfts.append(results[1]["ttft"])
+        hot_ttfts.extend(r["ttft"] for r in results[2:])
     return hot_ttfts, cold_ttfts
 
 
