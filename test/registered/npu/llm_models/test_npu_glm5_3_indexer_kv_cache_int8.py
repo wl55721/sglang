@@ -189,7 +189,8 @@ class TestNPUGLM53IndexerKVCacheInt8(CustomTestCase):
             other_args=BASE_ARGS,
             env=GLM_5_3_SINGLE_NODE_ENVS,
         )
-        info = requests.get(cls.base_url + "/get_server_info", timeout=30).json()
+        # Note: /get_server_info is deprecated, use /server_info instead.
+        info = requests.get(cls.base_url + "/server_info", timeout=30).json()
         cls.baseline_max_total_num_tokens = info["max_total_num_tokens"]
         cls.baseline_ttfts = measure_long_prefill_ttft(cls.base_url)
         terminate_and_kill_process_tree(cls.process)
@@ -203,7 +204,7 @@ class TestNPUGLM53IndexerKVCacheInt8(CustomTestCase):
             other_args=INT8_ARGS,
             env=GLM_5_3_SINGLE_NODE_ENVS,
         )
-        info = requests.get(cls.base_url + "/get_server_info", timeout=30).json()
+        info = requests.get(cls.base_url + "/server_info", timeout=30).json()
         cls.int8_max_total_num_tokens = info["max_total_num_tokens"]
         cls.int8_ttfts = measure_long_prefill_ttft(cls.base_url)
 
@@ -214,7 +215,7 @@ class TestNPUGLM53IndexerKVCacheInt8(CustomTestCase):
 
     def test_int8_recipe_active(self):
         """The running server must report the requested indexer cache dtype."""
-        info = requests.get(self.base_url + "/get_server_info", timeout=30).json()
+        info = requests.get(self.base_url + "/server_info", timeout=30).json()
         self.assertEqual(info["indexer_kv_cache_dtype"], "int8")
 
     def test_generation_functionality(self):

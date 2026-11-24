@@ -9,7 +9,7 @@ agnostic); this file verifies on NPU that:
 
 1. Functionality: `--schedule-policy uniboost` (+ `--uniboost-gamma`,
    `--enable-uniboost-gamma-ada`) serves every request correctly and the
-   running config is visible through /get_server_info.
+   running config is visible through /server_info.
 2. Effect: in a mixed burst (one long cold prompt + several cache-hot short
    requests), the TTFT (Time To First Token, first-token latency) of the
    cache-hot requests is materially lower than under the FCFS (First Come
@@ -228,7 +228,7 @@ class TestNPUUniboostSchedulePolicy(CustomTestCase):
 
     def test_uniboost_config_active(self):
         """The running server must report the uniboost policy and gamma."""
-        info = requests.get(self.base_url + "/get_server_info", timeout=30).json()
+        info = requests.get(self.base_url + "/server_info", timeout=30).json()
         self.assertEqual(info["schedule_policy"], "uniboost")
         self.assertEqual(float(info["uniboost_gamma"]), 10.0)
 
@@ -286,8 +286,9 @@ class TestNPUUniboostGammaAda(CustomTestCase):
         cls.out_log_file.close()
         cls.err_log_file.close()
 
-    def test_gamma_ada_config_active(self):
-        info = requests.get(self.base_url + "/get_server_info", timeout=30).json()
+    def test_uniboost_config_active(self):
+        # Note: /get_server_info is deprecated, use /server_info instead.
+        info = requests.get(self.base_url + "/server_info", timeout=30).json()
         self.assertEqual(info["schedule_policy"], "uniboost")
         self.assertEqual(info["enable_uniboost_gamma_ada"], True)
 
