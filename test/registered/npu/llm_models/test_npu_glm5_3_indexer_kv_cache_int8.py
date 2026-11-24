@@ -76,9 +76,12 @@ BASE_ARGS = [
     "--context-length",
     "32768",
     # Above the minimum viable fraction for this checkpoint (the sizing
-    # profile raises below 0.790 once weights are loaded).
+    # profile raises below 0.790 once weights are loaded). The KV pool must
+    # comfortably hold an ~5k-token probe PLUS its decode headroom, or the
+    # scheduler retracts the request at the first decode step and the request
+    # FINISH_ABORTs right after its first token (ttft == total).
     "--mem-fraction-static",
-    "0.8",
+    "0.85",
     "--max-running-requests",
     "32",
     "--quantization",
@@ -102,8 +105,10 @@ GLM_5_3_SINGLE_NODE_ENVS = {
 }
 LAUNCH_TIMEOUT = 3000
 
-# Deterministic ~8k-token prompts; long enough that indexer scoring dominates
-# prefill, unique enough that no radix-cache reuse hides the effect.
+# Deterministic ~5k-token prompts; long enough that indexer scoring dominates
+# prefill (still 2 chunks at --chunked-prefill-size 4096), unique enough that
+# no radix-cache reuse hides the effect, yet short enough to leave decode
+# headroom inside a small KV pool.
 _WORDS = [
     "delta",
     "echo",
@@ -124,7 +129,7 @@ _WORDS = [
 ]
 
 
-def build_long_prompt(seed: int, num_words: int = 6000) -> str:
+def build_long_prompt(seed: int, num_words: int = 4500) -> str:
     rng = random.Random(seed)
     body = " ".join(rng.choice(_WORDS) for _ in range(num_words))
     return f"Summarize the following text in one short sentence.\n\n{body}"
@@ -135,6 +140,7 @@ def stream_ttft(base_url: str, payload: dict) -> dict:
     start = time.perf_counter()
     ttft = None
     finish_reason = None
+    finish_reason_raw = None
     with requests.post(
         base_url + "/generate", json=payload, stream=True, timeout=600
     ) as resp:
@@ -150,13 +156,17 @@ def stream_ttft(base_url: str, payload: dict) -> dict:
                 ttft = time.perf_counter() - start
             meta = chunk.get("meta_info") or {}
             if meta.get("finish_reason"):
-                # Newer sglang returns a structured dict: {"type": ..., ...}
+                # Newer sglang returns a structured dict: {"type": "abort",
+                # "message": ..., ...}; keep both the normalized type and the
+                # raw dict (the abort message pinpoints the scheduler path).
                 fr = meta["finish_reason"]
+                finish_reason_raw = fr
                 finish_reason = fr.get("type") if isinstance(fr, dict) else fr
     return {
         "ttft": ttft,
         "total": time.perf_counter() - start,
         "finish_reason": finish_reason,
+        "finish_reason_raw": finish_reason_raw,
     }
 
 
@@ -199,6 +209,9 @@ class TestNPUGLM53IndexerKVCacheInt8(CustomTestCase):
         # Note: /get_server_info is deprecated, use /server_info instead.
         info = requests.get(cls.base_url + "/server_info", timeout=30).json()
         cls.baseline_max_total_num_tokens = info["max_total_num_tokens"]
+        # Pool size is the first suspect whenever a long probe FINISH_ABORTs:
+        # print it so a failure is diagnosable without re-running.
+        print(f"[indexer-int8] baseline max_total_num_tokens = {cls.baseline_max_total_num_tokens}")
         cls.baseline_ttfts = measure_long_prefill_ttft(cls.base_url)
         terminate_and_kill_process_tree(cls.process)
         cls.process = None
@@ -213,6 +226,7 @@ class TestNPUGLM53IndexerKVCacheInt8(CustomTestCase):
         )
         info = requests.get(cls.base_url + "/server_info", timeout=30).json()
         cls.int8_max_total_num_tokens = info["max_total_num_tokens"]
+        print(f"[indexer-int8] int8 max_total_num_tokens = {cls.int8_max_total_num_tokens}")
         cls.int8_ttfts = measure_long_prefill_ttft(cls.base_url)
 
     @classmethod
