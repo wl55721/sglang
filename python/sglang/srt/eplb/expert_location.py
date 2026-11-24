@@ -287,21 +287,31 @@ class ExpertLocationMetadata:
 
         _, num_physical_experts = physical_to_logical_map.shape
 
-        logical_to_all_physical_map_padded = F.pad(
-            logical_to_all_physical_map,
-            (0, num_physical_experts - logical_to_all_physical_map.shape[-1]),
+        # These maps are tiny startup-time metadata: pad and count on CPU so
+        # launch does not depend on device-side AICPU kernels. On NPU the
+        # PadV3 AICPU kernel can fail to load ("open so failed") when many EP
+        # ranks spawn at once, and the async failure then surfaces at the
+        # .cpu() sync below and aborts the scheduler before the first request.
+        # Keep separate device/cpu storages: update() rewrites them in place,
+        # so aliasing the two copies would desync EPLB rebalances.
+        logical_to_all_physical_map_cpu = logical_to_all_physical_map.cpu()
+        logical_to_all_physical_map_padded_cpu = F.pad(
+            logical_to_all_physical_map_cpu,
+            (0, num_physical_experts - logical_to_all_physical_map_cpu.shape[-1]),
             value=-1,
         )
-
-        logical_to_all_physical_map_num_valid = torch.count_nonzero(
-            logical_to_all_physical_map != -1, dim=-1
+        logical_to_all_physical_map_padded = (
+            logical_to_all_physical_map_padded_cpu.to(physical_to_logical_map.device)
         )
+        logical_to_all_physical_map_num_valid = torch.count_nonzero(
+            logical_to_all_physical_map_cpu != -1, dim=-1
+        ).to(physical_to_logical_map.device)
 
         return ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
             physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
-            logical_to_all_physical_map_cpu=logical_to_all_physical_map_padded.cpu(),
+            logical_to_all_physical_map_cpu=logical_to_all_physical_map_padded_cpu,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             ep_size=ep_size,
             logical_to_rank_dispatch_physical_map=(
