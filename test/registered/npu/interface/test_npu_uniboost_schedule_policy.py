@@ -49,8 +49,15 @@ BASE_ARGS = [
     # prefill iterations, so the scheduling difference is measurable.
     "--chunked-prefill-size",
     "2048",
+    # A real admission bottleneck is REQUIRED for the policy to matter: the
+    # schedule policy only reorders requests waiting for admission. With a
+    # cap >= the burst size every request is admitted at once and both
+    # policies behave identically (chunked prefill interleaves them the same
+    # way). Cap 2 = cold + 1 hot run concurrently; the rest must queue, so
+    # FCFS keeps the queued hots behind the whole cold prompt while uniboost
+    # admits the cache-hot requests first.
     "--max-running-requests",
-    "64",
+    "2",
     "--mem-fraction-static",
     "0.8",
 ]
