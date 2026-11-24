@@ -70,6 +70,11 @@ BASE_ARGS = [
     "--max-prefill-tokens",
     "8192",
     "--trust-remote-code",
+    # The ~8k-token probes must fit: with the checkpoint's default context
+    # window (~8k) the first prefill chunk still streams a token but the
+    # second chunk is admitted as over-length and FINISH_ABORTs.
+    "--context-length",
+    "32768",
     # Above the minimum viable fraction for this checkpoint (the sizing
     # profile raises below 0.790 once weights are loaded).
     "--mem-fraction-static",
