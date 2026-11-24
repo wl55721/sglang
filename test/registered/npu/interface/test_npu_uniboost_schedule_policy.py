@@ -53,12 +53,14 @@ BASE_ARGS = [
     # A real admission bottleneck is REQUIRED for the policy to matter: the
     # schedule policy only reorders requests waiting for admission. With a
     # cap >= the burst size every request is admitted at once and both
-    # policies behave identically (chunked prefill interleaves them the same
-    # way). Cap 2 = cold + 1 hot run concurrently; the rest must queue, so
-    # FCFS keeps the queued hots behind the whole cold prompt while uniboost
-    # admits the cache-hot requests first.
+    # policies behave identically. Cap 2 is also not enough: the second slot
+    # keeps rotating the cache-hot requests at their own latency in BOTH
+    # policies, so the hots never wait for the cold prompt. Cap 1 forces
+    # strict serialization: under FCFS the cold prompt holds the only slot
+    # and every hot waits out its full prefill, while uniboost admits the
+    # boosted cache-hot requests first and lets the cold prompt queue last.
     "--max-running-requests",
-    "2",
+    "1",
     "--mem-fraction-static",
     "0.8",
 ]
