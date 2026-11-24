@@ -70,8 +70,10 @@ BASE_ARGS = [
     "--max-prefill-tokens",
     "8192",
     "--trust-remote-code",
+    # Above the minimum viable fraction for this checkpoint (the sizing
+    # profile raises below 0.790 once weights are loaded).
     "--mem-fraction-static",
-    "0.75",
+    "0.8",
     "--max-running-requests",
     "32",
     "--quantization",
