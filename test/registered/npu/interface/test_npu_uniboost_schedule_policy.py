@@ -21,6 +21,7 @@ agnostic); this file verifies on NPU that:
 
 import json
 import random
+import re
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -252,29 +253,38 @@ class TestNPUUniboostSchedulePolicy(CustomTestCase):
 
 
 class TestNPUUniboostGammaAda(CustomTestCase):
-    """Functionality of --enable-uniboost-gamma-ada (Gamma Ada = online
-    automatic tuning of gamma from the observed latency tail).
+    """Functionality + effect of --enable-uniboost-gamma-ada (Gamma Ada =
+    online automatic tuning of gamma from the observed latency tail).
 
     Fires >= 256 completed requests so at least one gamma refit window
-    (256 samples) elapses, then checks the server is still healthy and the
-    config is reported. [Test Category] Interface.
+    (256 samples) elapses, then asserts the server is healthy, the config is
+    reported, at least one refit actually fired (its log line was emitted)
+    and gamma moved away from its initial value. [Test Category] Interface.
     """
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+        # Capture server output so the "UniBoost gamma-Ada refit #N: gamma=..."
+        # log lines (the only external view of the live gamma, which lives in
+        # scheduler-process memory) can be asserted afterwards.
+        cls.out_log_file = open("./uniboost_gamma_ada_out_log.txt", "w+", encoding="utf-8")
+        cls.err_log_file = open("./uniboost_gamma_ada_err_log.txt", "w+", encoding="utf-8")
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=GAMMA_ADA_ARGS,
+            return_stdout_stderr=(cls.out_log_file, cls.err_log_file),
         )
 
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
             terminate_and_kill_process_tree(cls.process)
+        cls.out_log_file.close()
+        cls.err_log_file.close()
 
     def test_gamma_ada_config_active(self):
         info = requests.get(self.base_url + "/get_server_info", timeout=30).json()
@@ -283,8 +293,10 @@ class TestNPUUniboostGammaAda(CustomTestCase):
 
     def test_sustained_load_across_refit_windows(self):
         """>= 256 completions cross at least one gamma-Ada refit window; all
-        requests must succeed and the server must stay responsive afterwards."""
-        waves = 8
+        requests must succeed, the server must stay responsive afterwards,
+        and at least one refit must have fired with a gamma that actually
+        moved away from the initial value (10.0)."""
+        waves = 10
         concurrency = 32
         for wave in range(waves):
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -299,6 +311,7 @@ class TestNPUUniboostGammaAda(CustomTestCase):
                                 "max_new_tokens": 8,
                                 "temperature": 0,
                             },
+                            "stream": True,
                         },
                     )
                     for _ in range(concurrency)
@@ -310,6 +323,29 @@ class TestNPUUniboostGammaAda(CustomTestCase):
         # Server still healthy after refit(s).
         health = requests.get(self.base_url + "/health", timeout=30)
         self.assertEqual(health.status_code, 200)
+
+        # Effect: the refit must actually have run and moved gamma. The live
+        # gamma is scheduler-internal, so assert on the refit log lines.
+        self.out_log_file.seek(0)
+        self.err_log_file.seek(0)
+        content = self.out_log_file.read() + self.err_log_file.read()
+        refits = re.findall(
+            r"UniBoost gamma-Ada refit #(\d+): gamma=([0-9.eE+-]+)", content
+        )
+        self.assertGreaterEqual(
+            len(refits),
+            1,
+            "no 'UniBoost gamma-Ada refit' line was logged; the online "
+            "tuner did not fire despite >= 256 completed requests",
+        )
+        moved_gamma = float(refits[-1][1])
+        self.assertNotAlmostEqual(
+            moved_gamma,
+            10.0,
+            delta=0.5,
+            msg=f"gamma-Ada fired {len(refits)} time(s) but gamma never left "
+            f"its initial value (last gamma={moved_gamma})",
+        )
 
 
 if __name__ == "__main__":
