@@ -312,7 +312,6 @@ class TestNPUUniboostGammaAda(CustomTestCase):
                                 "max_new_tokens": 8,
                                 "temperature": 0,
                             },
-                            "stream": True,
                         },
                     )
                     for _ in range(concurrency)
