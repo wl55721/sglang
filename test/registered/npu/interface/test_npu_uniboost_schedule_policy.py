@@ -126,7 +126,9 @@ def stream_generate_ttft(base_url: str, payload: dict) -> dict:
                 ttft = time.perf_counter() - start
             meta = chunk.get("meta_info") or {}
             if meta.get("finish_reason"):
-                finish_reason = meta["finish_reason"]
+                # Newer sglang returns a structured dict: {"type": ..., ...}
+                fr = meta["finish_reason"]
+                finish_reason = fr.get("type") if isinstance(fr, dict) else fr
     total = time.perf_counter() - start
     return {"ttft": ttft, "total": total, "finish_reason": finish_reason}
 
