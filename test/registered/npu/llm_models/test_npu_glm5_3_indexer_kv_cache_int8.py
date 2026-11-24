@@ -160,6 +160,7 @@ def measure_long_prefill_ttft(base_url: str, num_prompts: int = 12):
             {
                 "text": build_long_prompt(seed),
                 "sampling_params": {"max_new_tokens": 16, "temperature": 0},
+                "stream": True,
             },
         )
         assert result["finish_reason"] in ("stop", "length"), result

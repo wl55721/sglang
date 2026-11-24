@@ -144,6 +144,7 @@ def run_mixed_burst(base_url: str, cold_prompt: str, num_hot: int = 8, rounds: i
             payload = {
                 "text": cold_prompt,
                 "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+                "stream": True,
             }
             return stream_generate_ttft(base_url, payload)
 
@@ -152,6 +153,7 @@ def run_mixed_burst(base_url: str, cold_prompt: str, num_hot: int = 8, rounds: i
                 "text": SHARED_PASSAGE
                 + f"\n\nQuestion {round_idx}-{i}: What invention carried market prices faster than any courier? Answer in one word.",
                 "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+                "stream": True,
             }
             return stream_generate_ttft(base_url, payload)
 
