@@ -84,6 +84,13 @@ BASE_ARGS = [
     # probe prompts below, not by a bigger pool.
     "--mem-fraction-static",
     "0.8",
+    # Isolation guard: with the INT8 indexer recipe the very first execution
+    # of npu_quant_lightning_indexer happens inside decode-graph capture and
+    # the process dies silently right after "Capture target decode NPU graph
+    # begin". Running decode eagerly isolates the graph-capture incompat from
+    # the recipe itself. Prefill TTFT (the measured metric here) is not
+    # affected: prefill graph capture is already auto-disabled on this path.
+    "--disable-decode-cuda-graph",
     "--max-running-requests",
     "32",
     "--quantization",
