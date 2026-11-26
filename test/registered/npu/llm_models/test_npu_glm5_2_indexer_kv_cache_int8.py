@@ -10,28 +10,30 @@ to 130 (int8 key + fp16 scale), which raises the derived KV (Key/Value) cache
 capacity, and the INT8 GEMM (General Matrix Multiply) speeds up the indexer
 scoring that dominates long-context prefill.
 
-This file launches GLM-5.3-w8a8 (W8A8 = 8-bit weight, 8-bit activation
-quantization; GlmMoeDsa family on the generic ascend DSA path) twice - once
-without the flag (legacy bf16 indexer path) and once with
-`--indexer-kv-cache-dtype int8` - using the official single-node A3 recipe
+This file launches GLM-5.2-w4a8 - the GLM-5.2 quantized checkpoint family the
+PR itself validated (GSM8K accuracy parity + 25% TTFT reduction on A2/A3) -
+twice: once without the flag (legacy bf16 indexer path) and once with
+`--indexer-kv-cache-dtype int8`, using the single-node A3 recipe
 (`--tp-size 16`, one node / 8 physical cards), and verifies:
 
 1. Functionality: the recipe is active and normal generations complete.
-   (Model-level accuracy is gated by the existing GLM-5.3-w8a8 16P nightly
-   GPQA/GSM8K tests; the INT8 recipe's precision behavior was validated by
-   the PR #42224 unit tests, so no extra accuracy gate is duplicated here.)
 2. Effect: the derived KV capacity (max_total_num_tokens) strictly increases
    thanks to the halved indexer cache, and long-context prefill TTFT (Time
    To First Token) does not regress (target: >= 5% faster).
 
-Note: speculative decoding (NEXTN) is deliberately omitted from the launch
-args so prefill TTFT reflects the plain indexer path.
+Note: PR #42224 was authored against GLM5.2-w4a8-int; the GLM-5.3-w8a8
+checkpoint was measured NOT to work with the recipe on A3 (first-prefill
+segfault inside npu_quant_lightning_indexer even in eager mode, and a KV
+capacity regression instead of the expected increase), so this test pins the
+carrier to the GLM-5.2 family. Speculative decoding (NEXTN) is deliberately
+omitted from the launch args so prefill TTFT reflects the plain indexer path.
 
 [Test Category] Model
 [Test Target] --indexer-kv-cache-dtype int8
 """
 
 import json
+import os
 import random
 import time
 import unittest
@@ -40,7 +42,7 @@ from statistics import median
 import requests
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    GLM_5_3_W8A8_MODEL_PATH,
+    GLM_5_2_W4A8_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
@@ -51,11 +53,10 @@ from sglang.test.test_utils import (
 
 register_npu_ci(est_time=1800, suite="full-test-16-npu-a3", nightly=True)
 
-MODEL_PATH = GLM_5_3_W8A8_MODEL_PATH
-# Single-node A3 recipe from the official GLM-5.3-w8a8 tutorial
-# (--tp-size 16, one node = 8 physical cards / 16 dies). Non-FP8 main KV
-# cache is a hard requirement of the INT8 indexer recipe; dtype bfloat16
-# satisfies it.
+MODEL_PATH = GLM_5_2_W4A8_MODEL_PATH
+# Single-node A3 recipe (--tp-size 16, one node = 8 physical cards / 16
+# dies). Non-FP8 main KV cache is a hard requirement of the INT8 indexer
+# recipe; dtype bfloat16 satisfies it.
 BASE_ARGS = [
     "--device",
     "npu",
@@ -70,26 +71,17 @@ BASE_ARGS = [
     "--max-prefill-tokens",
     "8192",
     "--trust-remote-code",
-    # The effective prompt ceiling on this server is the KV pool, not the
-    # context length: the ingress check clamps to min(context_len,
-    # max_total_num_tokens), and max_total_num_tokens is only ~7k tokens at
-    # mem-fraction 0.8 for this DSA checkpoint. 32768 just keeps the model
-    # side from binding first; the pool is the real limit.
+    # The effective prompt ceiling is min(context_len, max_total_num_tokens);
+    # the KV pool on a TP16 single node is small for DSA checkpoints, so keep
+    # the model side from binding first and let the pool be the real limit.
     "--context-length",
     "32768",
-    # The minimum stable fraction for this checkpoint: the sizing profile
-    # raises below 0.790 once weights are loaded, and 0.85 leaves so little
-    # free memory that decode-graph capture segfaults inside the DSA indexer
-    # op (avail_mem ~9 GB). The abort on long probes is fixed by the shorter
-    # probe prompts below, not by a bigger pool.
     "--mem-fraction-static",
     "0.8",
-    # Isolation guard: with the INT8 indexer recipe the very first execution
-    # of npu_quant_lightning_indexer happens inside decode-graph capture and
-    # the process dies silently right after "Capture target decode NPU graph
-    # begin". Running decode eagerly isolates the graph-capture incompat from
-    # the recipe itself. Prefill TTFT (the measured metric here) is not
-    # affected: prefill graph capture is already auto-disabled on this path.
+    # Run decode eagerly: keeps the measured path free of graph-capture side
+    # effects, mirroring the DeepSeek-V3.2 NPU recipe. Prefill TTFT (the
+    # measured metric here) is unaffected: prefill graph capture is already
+    # auto-disabled on this path.
     "--disable-decode-cuda-graph",
     "--max-running-requests",
     "32",
@@ -104,8 +96,8 @@ BASE_ARGS = [
     "--disable-shared-experts-fusion",
 ]
 INT8_ARGS = BASE_ARGS + ["--indexer-kv-cache-dtype", "int8"]
-# Env vars from the same tutorial's single-node launch script.
-GLM_5_3_SINGLE_NODE_ENVS = {
+# Env vars commonly used by single-node A3 launch scripts.
+GLM_SINGLE_NODE_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "HCCL_BUFFSIZE": "1000",
@@ -117,8 +109,8 @@ LAUNCH_TIMEOUT = 3000
 # Deterministic ~5k-token prompts; long enough that indexer scoring dominates
 # prefill (still 2 chunks at --chunked-prefill-size 4096), unique enough that
 # no radix-cache reuse hides the effect. 2900 words tokenize to ~5.1k tokens
-# on the GLM tokenizer (~1.75 tokens per word), safely under the ~7k-token KV
-# pool ceiling that the ingress length check clamps to on this server.
+# on the GLM tokenizer (~1.75 tokens per word), safely under the KV pool
+# ceiling that the ingress length check clamps to on a TP16 single node.
 _WORDS = [
     "delta",
     "echo",
@@ -198,8 +190,12 @@ def measure_long_prefill_ttft(base_url: str, num_prompts: int = 12):
     return ttfts
 
 
-class TestNPUGLM53IndexerKVCacheInt8(CustomTestCase):
-    """INT8 indexer cache recipe on GLM-5.3-w8a8 (TP16 single node):
+@unittest.skipUnless(
+    os.path.isfile(os.path.join(GLM_5_2_W4A8_MODEL_PATH, "config.json")),
+    f"GLM-5.2-w4a8 model config not found at {GLM_5_2_W4A8_MODEL_PATH}",
+)
+class TestNPUGLM52IndexerKVCacheInt8(CustomTestCase):
+    """INT8 indexer cache recipe on GLM-5.2-w4a8 (TP16 single node):
     functionality + capacity/TTFT effect vs the bf16 indexer baseline.
     [Test Category] Model.
     """
@@ -214,7 +210,7 @@ class TestNPUGLM53IndexerKVCacheInt8(CustomTestCase):
             cls.base_url,
             timeout=LAUNCH_TIMEOUT,
             other_args=BASE_ARGS,
-            env=GLM_5_3_SINGLE_NODE_ENVS,
+            env=GLM_SINGLE_NODE_ENVS,
         )
         # Note: /get_server_info is deprecated, use /server_info instead.
         info = requests.get(cls.base_url + "/server_info", timeout=30).json()
@@ -232,7 +228,7 @@ class TestNPUGLM53IndexerKVCacheInt8(CustomTestCase):
             cls.base_url,
             timeout=LAUNCH_TIMEOUT,
             other_args=INT8_ARGS,
-            env=GLM_5_3_SINGLE_NODE_ENVS,
+            env=GLM_SINGLE_NODE_ENVS,
         )
         info = requests.get(cls.base_url + "/server_info", timeout=30).json()
         cls.int8_max_total_num_tokens = info["max_total_num_tokens"]
