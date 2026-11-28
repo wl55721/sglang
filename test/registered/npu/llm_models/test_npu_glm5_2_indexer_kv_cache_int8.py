@@ -19,7 +19,11 @@ twice: once without the flag (legacy bf16 indexer path) and once with
 1. Functionality: the recipe is active and normal generations complete.
 2. Effect: the derived KV capacity (max_total_num_tokens) strictly increases
    thanks to the halved indexer cache, and long-context prefill TTFT (Time
-   To First Token) does not regress (target: >= 5% faster).
+   To First Token) does not regress (target: >= 5% faster). The TTFT probe
+   reproduces the PR's own benchmark conditions: a shared ~180k-token prefix
+   (radix-cached by the first request) with unique ~10.8k-token questions and
+   output len 1, so each measured request prefills only the question while
+   the indexer scores it against ~190k cached KV.
 
 Note: PR #42224 was authored against GLM5.2-w4a8-int; the GLM-5.3-w8a8
 checkpoint was measured NOT to work with the recipe on A3 (first-prefill
@@ -71,11 +75,13 @@ BASE_ARGS = [
     "--max-prefill-tokens",
     "8192",
     "--trust-remote-code",
-    # The effective prompt ceiling is min(context_len, max_total_num_tokens);
-    # the measured KV pool on the A3 CI runner (~237k tokens) leaves
-    # --context-length as the binding limit for the ~24k-token probes below.
+    # The effective prompt ceiling is min(context_len, max_total_num_tokens).
+    # The shared-prefix probes below need ~191k tokens (180k prefix + 10.8k
+    # question), mirroring the PR's own GSP benchmark; the measured KV pool on
+    # the A3 CI runner (~237k tokens) holds one such request, so the model
+    # side must not bind first.
     "--context-length",
-    "32768",
+    "200000",
     "--mem-fraction-static",
     "0.8",
     # Run decode eagerly: keeps the measured path free of graph-capture side
@@ -106,24 +112,27 @@ GLM_SINGLE_NODE_ENVS = {
 }
 LAUNCH_TIMEOUT = 3000
 
-# Deterministic long prompts, sized to land in the regime where the indexer
-# GEMM dominates prefill: the GEMM's cost grows with the cached KV length each
-# chunk scores against, while the INT8 recipe's fixed per-chunk overhead
-# (hadamard rotation, dynamic quant, scale-buffer traffic) does not. At ~5k
-# tokens the two cancel and the recipe measures as a small net LOSS, with
-# per-seed TTFT noise (~10%) wider than the 5% margin asserted below; at
-# ~24k tokens (6 chunks at --chunked-prefill-size 4096) the GEMM term is ~5x
-# larger and the recipe's claimed gain clears both. Unique seeds keep
-# radix-cache reuse from hiding the effect.
+# Shared-prefix prompts that reproduce the regime the recipe was validated
+# in: PR #42224's own benchmark ran --dataset-name generated-shared-prefix
+# with a 180k-token system prompt, a 10.8k-token question and output len 1.
+# The first request prefills and radix-caches the shared prefix; every
+# measured request then shares it, so prefill covers only the unique
+# question while the indexer scores those queries against ~190k cached KV.
+# That is the regime where the indexer GEMM dominates prefill: its cost
+# grows with the cached KV length each chunk scores against, while the INT8
+# recipe's fixed per-chunk overhead (hadamard rotation, dynamic quant,
+# scale-buffer traffic) does not. At short contexts (~5k unique prompts)
+# the two cancel and the recipe measures as a small net LOSS, with per-seed
+# TTFT noise (~10%) wider than the 5% margin asserted below.
 #
-# Token arithmetic: ~1.75 tokens per word on the GLM tokenizer, so the prompt
-# length in words is derived at setUpClass time from TARGET_PROMPT_TOKENS and
-# the measured KV pool (capped at half the pool so the request always fits
-# alongside radix-cached predecessors). On the A3 CI runner the pool measures
-# ~237k tokens, so --context-length 32768 is the binding ceiling and the
-# target 24k sits safely under it.
-_TARGET_PROMPT_TOKENS = 24000
+# Prefix and questions are deterministic word soups (~1.75 tokens per word on
+# the GLM tokenizer), so both runs tokenize to identical shapes and the
+# per-seed pairing stays valid. Sizes are derived at setUpClass time from the
+# measured KV pool, capped so prefix + question always coexist in the pool.
+_TARGET_PREFIX_TOKENS = 180000
+_TARGET_QUESTION_TOKENS = 10828
 _TOKENS_PER_WORD = 1.75
+_PREFIX_SEED = 424242
 _WORDS = [
     "delta",
     "echo",
@@ -144,10 +153,9 @@ _WORDS = [
 ]
 
 
-def build_long_prompt(seed: int, num_words: int) -> str:
+def build_words(seed: int, num_words: int) -> str:
     rng = random.Random(seed)
-    body = " ".join(rng.choice(_WORDS) for _ in range(num_words))
-    return f"Summarize the following text in one short sentence.\n\n{body}"
+    return " ".join(rng.choice(_WORDS) for _ in range(num_words))
 
 
 def stream_ttft(base_url: str, payload: dict) -> dict:
@@ -185,38 +193,36 @@ def stream_ttft(base_url: str, payload: dict) -> dict:
     }
 
 
-def measure_long_prefill_ttft(
-    base_url: str, num_words: int, num_prompts: int = 20, warmup: int = 3
+def measure_shared_prefix_ttft(
+    base_url: str, prefix_prompt: str, question_num_words: int, num_prompts: int = 20
 ):
-    """Sequential long-prompt generation; prefill dominates each request.
+    """Shared-prefix TTFT, mirroring the PR's GSP benchmark conditions.
 
-    Fires `warmup` throwaway requests first (distinct seeds) so the measured
-    loop does not pay first-request costs (JIT compile, HCCL rendezvous,
-    allocator growth) that differ between the two server launches and would
-    otherwise bias whichever config happens to run first. Three warmups
-    because the last CI run still showed the first ~5 measured requests of
-    the second launch elevated by 5-10%.
+    Seed 0 runs first (max_new_tokens=1) and pays the one-off ~180k-token
+    prefix prefill that fills the radix cache; its TTFT is NOT recorded.
+    Every measured request then shares that prefix, so prefill covers only
+    its unique question while the indexer scores the new queries against
+    ~190k cached KV — the regime where the INT8 recipe's GEMM gain must
+    clear its fixed per-chunk quantization overhead. Output length is 1,
+    mirroring the PR benchmark's --gsp-output-len 1: the reported time is
+    essentially pure prefill TTFT.
     """
-    for seed in range(10_000, 10_000 + warmup):
-        result = stream_ttft(
+
+    def ask(seed: int) -> dict:
+        return stream_ttft(
             base_url,
             {
-                "text": build_long_prompt(seed, num_words),
+                "text": prefix_prompt + "\n" + build_words(seed, question_num_words),
                 "sampling_params": {"max_new_tokens": 1, "temperature": 0},
                 "stream": True,
             },
         )
-        assert result["finish_reason"] in ("stop", "length"), result
+
+    result = ask(0)
+    assert result["finish_reason"] in ("stop", "length"), result
     ttfts = []
-    for seed in range(num_prompts):
-        result = stream_ttft(
-            base_url,
-            {
-                "text": build_long_prompt(seed, num_words),
-                "sampling_params": {"max_new_tokens": 16, "temperature": 0},
-                "stream": True,
-            },
-        )
+    for seed in range(1, num_prompts + 1):
+        result = ask(seed)
         assert result["finish_reason"] in ("stop", "length"), result
         assert result["ttft"] is not None, "no token was streamed back"
         ttfts.append(result["ttft"])
@@ -251,15 +257,35 @@ class TestNPUGLM52IndexerKVCacheInt8(CustomTestCase):
         # Pool size is the first suspect whenever a long probe FINISH_ABORTs:
         # print it so a failure is diagnosable without re-running.
         print(f"[indexer-int8] baseline max_total_num_tokens = {cls.baseline_max_total_num_tokens}")
-        # Size the measured prompts from the (smaller) baseline pool, capped at
-        # half of it so a request always fits alongside radix-cached
-        # predecessors regardless of hardware.
-        target_tokens = min(
-            _TARGET_PROMPT_TOKENS, cls.baseline_max_total_num_tokens // 2
+        # Size the shared prefix and question from the (smaller) baseline pool
+        # so prefix + question always coexist in the pool regardless of
+        # hardware; skip when the pool cannot hold a meaningful long-context
+        # probe at all.
+        prefix_tokens = min(
+            _TARGET_PREFIX_TOKENS, int(cls.baseline_max_total_num_tokens * 0.70)
         )
-        cls.num_words = max(1, int(target_tokens / _TOKENS_PER_WORD))
-        print(f"[indexer-int8] prompt size = {target_tokens} tokens (~{cls.num_words} words)")
-        cls.baseline_ttfts = measure_long_prefill_ttft(cls.base_url, cls.num_words)
+        question_tokens = min(
+            _TARGET_QUESTION_TOKENS, int(cls.baseline_max_total_num_tokens * 0.05)
+        )
+        if prefix_tokens < 32768:
+            raise unittest.SkipTest(
+                f"KV pool too small for the shared-prefix probe: "
+                f"{cls.baseline_max_total_num_tokens} tokens "
+                f"(need >= ~47k for a 33k+ prefix)"
+            )
+        cls.prefix_prompt = (
+            "Summarize the following text in one short sentence.\n\n"
+            + build_words(_PREFIX_SEED, int(prefix_tokens / _TOKENS_PER_WORD))
+        )
+        cls.question_num_words = max(1, int(question_tokens / _TOKENS_PER_WORD))
+        print(
+            f"[indexer-int8] shared prefix = ~{prefix_tokens} tokens, "
+            f"question = ~{question_tokens} tokens "
+            f"({cls.question_num_words} words)"
+        )
+        cls.baseline_ttfts = measure_shared_prefix_ttft(
+            cls.base_url, cls.prefix_prompt, cls.question_num_words
+        )
         terminate_and_kill_process_tree(cls.process)
         cls.process = None
 
@@ -274,7 +300,9 @@ class TestNPUGLM52IndexerKVCacheInt8(CustomTestCase):
         info = requests.get(cls.base_url + "/server_info", timeout=30).json()
         cls.int8_max_total_num_tokens = info["max_total_num_tokens"]
         print(f"[indexer-int8] int8 max_total_num_tokens = {cls.int8_max_total_num_tokens}")
-        cls.int8_ttfts = measure_long_prefill_ttft(cls.base_url, cls.num_words)
+        cls.int8_ttfts = measure_shared_prefix_ttft(
+            cls.base_url, cls.prefix_prompt, cls.question_num_words
+        )
 
     @classmethod
     def tearDownClass(cls):
