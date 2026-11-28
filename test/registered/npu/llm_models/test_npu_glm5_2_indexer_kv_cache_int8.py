@@ -51,7 +51,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_npu_ci(est_time=1800, suite="full-test-16-npu-a3", nightly=True)
+register_npu_ci(est_time=2400, suite="full-test-16-npu-a3", nightly=True)
 
 MODEL_PATH = GLM_5_2_W4A8_MODEL_PATH
 # Single-node A3 recipe (--tp-size 16, one node = 8 physical cards / 16
@@ -72,8 +72,8 @@ BASE_ARGS = [
     "8192",
     "--trust-remote-code",
     # The effective prompt ceiling is min(context_len, max_total_num_tokens);
-    # the KV pool on a TP16 single node is small for DSA checkpoints, so keep
-    # the model side from binding first and let the pool be the real limit.
+    # the measured KV pool on the A3 CI runner (~237k tokens) leaves
+    # --context-length as the binding limit for the ~24k-token probes below.
     "--context-length",
     "32768",
     "--mem-fraction-static",
@@ -106,11 +106,24 @@ GLM_SINGLE_NODE_ENVS = {
 }
 LAUNCH_TIMEOUT = 3000
 
-# Deterministic ~5k-token prompts; long enough that indexer scoring dominates
-# prefill (still 2 chunks at --chunked-prefill-size 4096), unique enough that
-# no radix-cache reuse hides the effect. 2900 words tokenize to ~5.1k tokens
-# on the GLM tokenizer (~1.75 tokens per word), safely under the KV pool
-# ceiling that the ingress length check clamps to on a TP16 single node.
+# Deterministic long prompts, sized to land in the regime where the indexer
+# GEMM dominates prefill: the GEMM's cost grows with the cached KV length each
+# chunk scores against, while the INT8 recipe's fixed per-chunk overhead
+# (hadamard rotation, dynamic quant, scale-buffer traffic) does not. At ~5k
+# tokens the two cancel and the recipe measures as a small net LOSS, with
+# per-seed TTFT noise (~10%) wider than the 5% margin asserted below; at
+# ~24k tokens (6 chunks at --chunked-prefill-size 4096) the GEMM term is ~5x
+# larger and the recipe's claimed gain clears both. Unique seeds keep
+# radix-cache reuse from hiding the effect.
+#
+# Token arithmetic: ~1.75 tokens per word on the GLM tokenizer, so the prompt
+# length in words is derived at setUpClass time from TARGET_PROMPT_TOKENS and
+# the measured KV pool (capped at half the pool so the request always fits
+# alongside radix-cached predecessors). On the A3 CI runner the pool measures
+# ~237k tokens, so --context-length 32768 is the binding ceiling and the
+# target 24k sits safely under it.
+_TARGET_PROMPT_TOKENS = 24000
+_TOKENS_PER_WORD = 1.75
 _WORDS = [
     "delta",
     "echo",
@@ -131,7 +144,7 @@ _WORDS = [
 ]
 
 
-def build_long_prompt(seed: int, num_words: int = 2900) -> str:
+def build_long_prompt(seed: int, num_words: int) -> str:
     rng = random.Random(seed)
     body = " ".join(rng.choice(_WORDS) for _ in range(num_words))
     return f"Summarize the following text in one short sentence.\n\n{body}"
@@ -172,19 +185,23 @@ def stream_ttft(base_url: str, payload: dict) -> dict:
     }
 
 
-def measure_long_prefill_ttft(base_url: str, num_prompts: int = 20, warmup: int = 2):
+def measure_long_prefill_ttft(
+    base_url: str, num_words: int, num_prompts: int = 20, warmup: int = 3
+):
     """Sequential long-prompt generation; prefill dominates each request.
 
     Fires `warmup` throwaway requests first (distinct seeds) so the measured
     loop does not pay first-request costs (JIT compile, HCCL rendezvous,
     allocator growth) that differ between the two server launches and would
-    otherwise bias whichever config happens to run first.
+    otherwise bias whichever config happens to run first. Three warmups
+    because the last CI run still showed the first ~5 measured requests of
+    the second launch elevated by 5-10%.
     """
     for seed in range(10_000, 10_000 + warmup):
         result = stream_ttft(
             base_url,
             {
-                "text": build_long_prompt(seed),
+                "text": build_long_prompt(seed, num_words),
                 "sampling_params": {"max_new_tokens": 1, "temperature": 0},
                 "stream": True,
             },
@@ -195,7 +212,7 @@ def measure_long_prefill_ttft(base_url: str, num_prompts: int = 20, warmup: int 
         result = stream_ttft(
             base_url,
             {
-                "text": build_long_prompt(seed),
+                "text": build_long_prompt(seed, num_words),
                 "sampling_params": {"max_new_tokens": 16, "temperature": 0},
                 "stream": True,
             },
@@ -234,7 +251,15 @@ class TestNPUGLM52IndexerKVCacheInt8(CustomTestCase):
         # Pool size is the first suspect whenever a long probe FINISH_ABORTs:
         # print it so a failure is diagnosable without re-running.
         print(f"[indexer-int8] baseline max_total_num_tokens = {cls.baseline_max_total_num_tokens}")
-        cls.baseline_ttfts = measure_long_prefill_ttft(cls.base_url)
+        # Size the measured prompts from the (smaller) baseline pool, capped at
+        # half of it so a request always fits alongside radix-cached
+        # predecessors regardless of hardware.
+        target_tokens = min(
+            _TARGET_PROMPT_TOKENS, cls.baseline_max_total_num_tokens // 2
+        )
+        cls.num_words = max(1, int(target_tokens / _TOKENS_PER_WORD))
+        print(f"[indexer-int8] prompt size = {target_tokens} tokens (~{cls.num_words} words)")
+        cls.baseline_ttfts = measure_long_prefill_ttft(cls.base_url, cls.num_words)
         terminate_and_kill_process_tree(cls.process)
         cls.process = None
 
@@ -249,7 +274,7 @@ class TestNPUGLM52IndexerKVCacheInt8(CustomTestCase):
         info = requests.get(cls.base_url + "/server_info", timeout=30).json()
         cls.int8_max_total_num_tokens = info["max_total_num_tokens"]
         print(f"[indexer-int8] int8 max_total_num_tokens = {cls.int8_max_total_num_tokens}")
-        cls.int8_ttfts = measure_long_prefill_ttft(cls.base_url)
+        cls.int8_ttfts = measure_long_prefill_ttft(cls.base_url, cls.num_words)
 
     @classmethod
     def tearDownClass(cls):
