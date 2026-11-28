@@ -44,6 +44,7 @@ import unittest
 from statistics import median
 
 import requests
+from transformers import AutoTokenizer
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     GLM_5_2_W4A8_MODEL_PATH,
@@ -194,25 +195,35 @@ def stream_ttft(base_url: str, payload: dict) -> dict:
 
 
 def measure_shared_prefix_ttft(
-    base_url: str, prefix_prompt: str, question_num_words: int, num_prompts: int = 20
+    base_url: str, tokenizer, prefix_ids, question_num_words: int, num_prompts: int = 20
 ):
     """Shared-prefix TTFT, mirroring the PR's GSP benchmark conditions.
 
+    Requests go out as pre-tokenized ``input_ids``: having the server
+    tokenize ~191k tokens of text per request adds a large constant to every
+    TTFT that is identical in both runs, and a constant added to numerator
+    and denominator pulls the measured INT8/baseline ratio toward 1.0 (a
+    text-payload run measured only 0.966 despite the recipe's claimed gain).
+    Pre-tokenizing here keeps TTFT on the scheduler + prefill path that the
+    recipe actually changes.
+
     Seed 0 runs first (max_new_tokens=1) and pays the one-off ~180k-token
     prefix prefill that fills the radix cache; its TTFT is NOT recorded.
-    Every measured request then shares that prefix, so prefill covers only
-    its unique question while the indexer scores the new queries against
-    ~190k cached KV — the regime where the INT8 recipe's GEMM gain must
-    clear its fixed per-chunk quantization overhead. Output length is 1,
-    mirroring the PR benchmark's --gsp-output-len 1: the reported time is
-    essentially pure prefill TTFT.
+    Every measured request then shares the same leading ``prefix_ids``, so
+    prefill covers only its unique question while the indexer scores the new
+    queries against ~190k cached KV. Output length is 1, mirroring the PR
+    benchmark's --gsp-output-len 1: the reported time is essentially pure
+    prefill TTFT.
     """
 
     def ask(seed: int) -> dict:
+        question_ids = tokenizer("\n" + build_words(seed, question_num_words))[
+            "input_ids"
+        ]
         return stream_ttft(
             base_url,
             {
-                "text": prefix_prompt + "\n" + build_words(seed, question_num_words),
+                "input_ids": prefix_ids + question_ids,
                 "sampling_params": {"max_new_tokens": 1, "temperature": 0},
                 "stream": True,
             },
@@ -273,18 +284,23 @@ class TestNPUGLM52IndexerKVCacheInt8(CustomTestCase):
                 f"{cls.baseline_max_total_num_tokens} tokens "
                 f"(need >= ~47k for a 33k+ prefix)"
             )
-        cls.prefix_prompt = (
+        # Pre-tokenize the shared prefix once; requests go out as input_ids so
+        # the server never re-tokenizes ~191k tokens of text per request (see
+        # measure_shared_prefix_ttft for why that dilution matters).
+        cls.tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+        prefix_text = (
             "Summarize the following text in one short sentence.\n\n"
             + build_words(_PREFIX_SEED, int(prefix_tokens / _TOKENS_PER_WORD))
         )
+        cls.prefix_ids = cls.tokenizer(prefix_text)["input_ids"]
         cls.question_num_words = max(1, int(question_tokens / _TOKENS_PER_WORD))
         print(
-            f"[indexer-int8] shared prefix = ~{prefix_tokens} tokens, "
-            f"question = ~{question_tokens} tokens "
+            f"[indexer-int8] shared prefix = {len(cls.prefix_ids)} ids "
+            f"(~{prefix_tokens} tokens), question = ~{question_tokens} tokens "
             f"({cls.question_num_words} words)"
         )
         cls.baseline_ttfts = measure_shared_prefix_ttft(
-            cls.base_url, cls.prefix_prompt, cls.question_num_words
+            cls.base_url, cls.tokenizer, cls.prefix_ids, cls.question_num_words
         )
         terminate_and_kill_process_tree(cls.process)
         cls.process = None
@@ -301,7 +317,7 @@ class TestNPUGLM52IndexerKVCacheInt8(CustomTestCase):
         cls.int8_max_total_num_tokens = info["max_total_num_tokens"]
         print(f"[indexer-int8] int8 max_total_num_tokens = {cls.int8_max_total_num_tokens}")
         cls.int8_ttfts = measure_shared_prefix_ttft(
-            cls.base_url, cls.prefix_prompt, cls.question_num_words
+            cls.base_url, cls.tokenizer, cls.prefix_ids, cls.question_num_words
         )
 
     @classmethod
