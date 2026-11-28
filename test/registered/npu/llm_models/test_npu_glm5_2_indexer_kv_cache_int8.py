@@ -172,8 +172,24 @@ def stream_ttft(base_url: str, payload: dict) -> dict:
     }
 
 
-def measure_long_prefill_ttft(base_url: str, num_prompts: int = 12):
-    """Sequential long-prompt generation; prefill dominates each request."""
+def measure_long_prefill_ttft(base_url: str, num_prompts: int = 20, warmup: int = 2):
+    """Sequential long-prompt generation; prefill dominates each request.
+
+    Fires `warmup` throwaway requests first (distinct seeds) so the measured
+    loop does not pay first-request costs (JIT compile, HCCL rendezvous,
+    allocator growth) that differ between the two server launches and would
+    otherwise bias whichever config happens to run first.
+    """
+    for seed in range(10_000, 10_000 + warmup):
+        result = stream_ttft(
+            base_url,
+            {
+                "text": build_long_prompt(seed),
+                "sampling_params": {"max_new_tokens": 1, "temperature": 0},
+                "stream": True,
+            },
+        )
+        assert result["finish_reason"] in ("stop", "length"), result
     ttfts = []
     for seed in range(num_prompts):
         result = stream_ttft(
@@ -277,14 +293,34 @@ class TestNPUGLM52IndexerKVCacheInt8(CustomTestCase):
 
     def test_long_prefill_ttft_no_regression(self):
         """Effect: INT8 indexer scoring must not regress (and is expected to
-        speed up) long-context prefill TTFT."""
-        baseline_median = median(self.baseline_ttfts)
-        int8_median = median(self.int8_ttfts)
+        speed up) long-context prefill TTFT.
+
+        The baseline and INT8 servers are measured in two separate sequential
+        runs, so a raw median-vs-median comparison is exposed to whole-run
+        machine drift (clock/thermal state, co-tenants) that is larger than
+        the 5% margin being asserted. Instead, prompts use identical seeds in
+        both runs, so the comparison is paired: per-seed INT8/baseline TTFT
+        ratios are computed and their median is asserted. Run-wide
+        multiplicative drift cancels in the per-seed ratios; only per-prompt
+        noise, which the median of 20 samples suppresses, remains.
+        """
+        self.assertEqual(
+            len(self.baseline_ttfts), len(self.int8_ttfts), "paired runs diverged"
+        )
+        ratios = [
+            i / b for i, b in zip(self.int8_ttfts, self.baseline_ttfts) if b > 0
+        ]
+        median_ratio = median(ratios)
+        print(
+            f"[indexer-int8] per-seed INT8/baseline TTFT ratios = "
+            f"{[round(r, 3) for r in ratios]}"
+        )
         self.assertLessEqual(
-            int8_median,
-            baseline_median * 0.95,
-            f"INT8 indexer regressed long-context prefill TTFT: "
-            f"median {int8_median:.3f}s vs baseline {baseline_median:.3f}s",
+            median_ratio,
+            0.95,
+            f"INT8 indexer regressed long-context prefill TTFT: paired median "
+            f"ratio {median_ratio:.3f} (INT8 {median(self.int8_ttfts):.3f}s vs "
+            f"baseline {median(self.baseline_ttfts):.3f}s)",
         )
 
 
